@@ -25,6 +25,7 @@ from app.ledger import (
     render_ledger_html,
     sort_ledger_by_win_prob,
 )
+from app.ml.intraday_entry import analyze_hourly_entry
 from app.ml.pipeline import (
     TrainedArtifacts,
     load_artifacts,
@@ -376,6 +377,45 @@ def analyze_stock(q: str) -> dict[str, Any]:
     if res is None:
         raise HTTPException(status_code=404, detail=f"Stock '{q}' not found in loaded universe.")
     return res
+
+
+@app.get("/api/entry-timing/scan")
+def scan_hourly_entry_timing() -> dict[str, Any]:
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if state.last_scan is None:
+        get_latest_scan()
+    targets = [
+        {"symbol": item["symbol"], "name": item.get("name", item["symbol"]), "side": item["side"]}
+        for item in (state.last_scan.get("top_longs") or []) + (state.last_scan.get("top_shorts") or [])
+    ]
+    items: dict[str, Any] = {}
+    enter_now: list[dict[str, Any]] = []
+
+    def _check(t: dict[str, str]) -> tuple[str, dict[str, Any]]:
+        res = analyze_hourly_entry(t["symbol"], side=t["side"])
+        res["name"] = t["name"]
+        return f"{t['side']}:{t['symbol']}", res
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for key, res in pool.map(_check, targets):
+            items[key] = res
+            if res.get("status") == "OK" and res.get("signal") == "ENTER_NOW":
+                enter_now.append(res)
+
+    return {
+        "checked_at": datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds"),
+        "count": len(items),
+        "enter_now": enter_now,
+        "items": items,
+    }
+
+
+@app.get("/api/entry-timing/{symbol}")
+def get_hourly_entry_timing(symbol: str, side: str = "LONG") -> dict[str, Any]:
+    return analyze_hourly_entry(symbol.upper().strip(), side=side)
 
 
 @app.get("/api/stock/{symbol}")

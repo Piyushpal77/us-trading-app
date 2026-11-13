@@ -33,7 +33,7 @@ class ScreenerConfig(BaseModel):
         le=0.95,
         description="Minimum ML win probability required to recommend a trade (0.0 = always show top_k).",
     )
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int = Field(default=10, ge=1, le=20)
     history_years: int = Field(default=10, ge=2, le=15)
     provisional_cutoff_et: str = Field(default="15:50")
     universe_limit: int = Field(

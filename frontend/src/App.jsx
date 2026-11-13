@@ -48,8 +48,9 @@ function ModeBadge({ mode }) {
   );
 }
 
-function SignalCard({ item, onSelect }) {
+function SignalCard({ item, timing, onSelect }) {
   const isLong = item.side === "LONG";
+  const isEnterNow = timing?.status === "OK" && timing?.signal === "ENTER_NOW";
   const gainPct =
     item.target_gain_pct ??
     (
@@ -61,7 +62,13 @@ function SignalCard({ item, onSelect }) {
   return (
     <div
       onClick={() => onSelect(item)}
-      className="group cursor-pointer rounded-xl border border-slate-800 bg-slate-900/70 hover:bg-slate-900 hover:border-slate-700 p-4 transition-all"
+      className={`group cursor-pointer rounded-xl border-2 p-4 transition-all ${
+        isEnterNow
+          ? isLong
+            ? "flash-enter-long"
+            : "flash-enter-short"
+          : "border border-slate-800 bg-slate-900/70 hover:bg-slate-900 hover:border-slate-700"
+      }`}
     >
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -81,6 +88,21 @@ function SignalCard({ item, onSelect }) {
             {item.index_membership && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
                 {item.index_membership}
+              </span>
+            )}
+            {timing?.status === "OK" && (
+              <span
+                className={`text-[11px] font-black px-2.5 py-0.5 rounded-full border tracking-wide ${
+                  timing.signal === "ENTER_NOW"
+                    ? isLong
+                      ? "bg-emerald-400 text-slate-950 border-emerald-200 shadow-md shadow-emerald-400/50 animate-pulse"
+                      : "bg-rose-500 text-white border-rose-200 shadow-md shadow-rose-500/50 animate-pulse"
+                    : timing.signal === "NEUTRAL_LIMIT"
+                      ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
+                      : "bg-amber-500/15 text-amber-300 border-amber-500/40"
+                }`}
+              >
+                {timing.signal === "ENTER_NOW" ? "⚡ ENTER NOW" : timing.signal}
               </span>
             )}
           </div>
@@ -164,6 +186,12 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [lookupResult, setLookupResult] = useState(null);
   const [lookupLoading, setLookupLoading] = useState(false);
+  const [entryTiming, setEntryTiming] = useState(null);
+  const [stockEntryTiming, setStockEntryTiming] = useState(null);
+  const [hourlyScan, setHourlyScan] = useState(null);
+  const [hourlyAuto, setHourlyAuto] = useState(true);
+  const [hourlyChecking, setHourlyChecking] = useState(false);
+  const [alertDismissed, setAlertDismissed] = useState(false);
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
@@ -209,16 +237,54 @@ export default function App() {
     try {
       const res = await api(`/api/analyze?q=${encodeURIComponent(q)}`);
       setLookupResult(res);
+      api(`/api/entry-timing/${encodeURIComponent(res.symbol)}?side=${encodeURIComponent(res.side)}`)
+        .then(setEntryTiming)
+        .catch(() => setEntryTiming(null));
     } catch (err) {
       setLookupResult(null);
+      setEntryTiming(null);
       setErrorMsg(err.message);
     } finally {
       setLookupLoading(false);
     }
   }
 
+  async function checkHourlyTiming(notifyOnNew = false) {
+    setHourlyChecking(true);
+    try {
+      const prevKeys = new Set((hourlyScan?.enter_now || []).map((x) => `${x.side}:${x.symbol}`));
+      const res = await api("/api/entry-timing/scan");
+      setHourlyScan(res);
+      const nowList = res?.enter_now || [];
+      const newlyEntered = nowList.filter((x) => !prevKeys.has(`${x.side}:${x.symbol}`));
+      if (nowList.length > 0 && notifyOnNew && newlyEntered.length > 0) {
+        setAlertDismissed(false);
+        try {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = "sine";
+          osc.frequency.value = 880;
+          gain.gain.value = 0.06;
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.18);
+        } catch {}
+        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+          const names = newlyEntered.map((x) => `${x.symbol} (${x.side} @ $${x.current_price})`).join(", ");
+          new Notification("⚡ ENTER NOW Alert — US Trading App", { body: names });
+        }
+      }
+    } catch {
+      // silent background check failure
+    } finally {
+      setHourlyChecking(false);
+    }
+  }
+
   useEffect(() => {
-    loadAll();
+    loadAll().then(() => checkHourlyTiming(false));
     const params = new URLSearchParams(window.location.search);
     const sym = params.get("open_trade");
     const recDate = params.get("rec_date");
@@ -229,11 +295,26 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    if (!hourlyAuto) return;
+    const timer = setInterval(() => {
+      checkHourlyTiming(true);
+    }, 60 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [hourlyAuto, hourlyScan]);
+
   async function handleSelectStock(item) {
     setSelectedStock(item);
+    setStockEntryTiming(null);
     try {
-      const data = await api(`/api/stock/${item.symbol}?days=120`);
+      const [data, timing] = await Promise.all([
+        api(`/api/stock/${item.symbol}?days=120`),
+        api(`/api/entry-timing/${encodeURIComponent(item.symbol)}?side=${encodeURIComponent(item.side)}`).catch(
+          () => null
+        ),
+      ]);
       setStockCandles(data.candles || []);
+      setStockEntryTiming(timing);
     } catch (e) {
       setStockCandles([]);
     }
@@ -405,7 +486,7 @@ export default function App() {
 
         <div className="max-w-7xl mx-auto px-4 sm:px-6 flex gap-6 border-t border-slate-800/60 text-xs font-semibold">
           {[
-            { id: "opportunities", label: "Top 5 Longs & Shorts", icon: TrendingUp },
+            { id: "opportunities", label: `Top ${config?.top_k ?? 10} Longs & Shorts`, icon: TrendingUp },
             { id: "tracker", label: `Trade Tracker (${ledger.count})`, icon: ListChecks },
             { id: "holdings", label: `Holdings Exit Alerts (${holdings.length})`, icon: ShieldAlert },
             { id: "backtest", label: "Walk-Forward Backtest & SHAP", icon: BarChart3 },
@@ -447,6 +528,88 @@ export default function App() {
             </button>
           </div>
         )}
+
+        {hourlyScan?.enter_now?.length > 0 && !alertDismissed && (
+          <div className="rounded-xl border-2 border-slate-200/40 bg-slate-950/90 px-4 py-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xl">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="px-2.5 py-1 rounded-full bg-white text-slate-950 font-black tracking-wide animate-pulse">
+                ⚡ ENTER NOW ({hourlyScan.enter_now.length})
+              </span>
+              {hourlyScan.enter_now.map((x) => {
+                const isL = x.side === "LONG";
+                return (
+                  <button
+                    key={`${x.side}-${x.symbol}`}
+                    type="button"
+                    onClick={() => {
+                      const match = [...(scan?.top_longs || []), ...(scan?.top_shorts || [])].find(
+                        (c) => c.symbol === x.symbol && c.side === x.side
+                      );
+                      if (match) handleSelectStock(match);
+                    }}
+                    className={`px-3 py-1 rounded-lg border-2 font-mono font-black cursor-pointer ${
+                      isL
+                        ? "flash-enter-long text-emerald-200"
+                        : "flash-enter-short text-rose-200"
+                    }`}
+                  >
+                    {x.symbol} · {x.side} @ ${x.current_price}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={() => setAlertDismissed(true)}
+              className="text-slate-300 hover:text-white cursor-pointer"
+              title="Dismiss alert banner"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 text-slate-300">
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="font-semibold text-white">Hourly Entry Monitor:</span>
+            <span className="text-slate-400">
+              {hourlyScan?.checked_at
+                ? `Last checked ${hourlyScan.checked_at.slice(11, 19)} ET · ${hourlyScan.enter_now?.length || 0} ENTER_NOW`
+                : "Checking 1h bars..."}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => checkHourlyTiming(true)}
+              disabled={hourlyChecking}
+              className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium disabled:opacity-50 cursor-pointer"
+            >
+              {hourlyChecking ? "Checking 1H..." : "Check 1H Now"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setHourlyAuto((v) => !v)}
+              className={`px-2.5 py-1 rounded-lg border font-semibold cursor-pointer ${
+                hourlyAuto
+                  ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
+                  : "bg-slate-800 border-slate-700 text-slate-400"
+              }`}
+            >
+              Auto (1H): {hourlyAuto ? "ON" : "OFF"}
+            </button>
+            {typeof Notification !== "undefined" && Notification.permission === "default" && (
+              <button
+                type="button"
+                onClick={() => Notification.requestPermission()}
+                className="px-2.5 py-1 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-sky-300 font-medium cursor-pointer"
+              >
+                Enable Desktop Alerts
+              </button>
+            )}
+          </div>
+        </div>
 
         {scan?.market_indices?.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -595,6 +758,28 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+                  {entryTiming && entryTiming.status === "OK" && (
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/80 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-semibold text-slate-400">1H / 4H Entry Timing:</span>
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                            entryTiming.signal === "ENTER_NOW"
+                              ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                              : entryTiming.signal === "NEUTRAL_LIMIT"
+                                ? "bg-sky-500/20 text-sky-300 border-sky-500/40"
+                                : "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                          }`}
+                        >
+                          {entryTiming.signal}
+                        </span>
+                        <span className="text-slate-300">{entryTiming.reason}</span>
+                      </div>
+                      <div className="font-mono text-[11px] text-slate-300">
+                        Limit Entry: <span className="text-sky-300 font-bold">${entryTiming.suggested_entry}</span> · 1h RSI {entryTiming.rsi_14_1h} · 4h RSI {entryTiming.rsi_14_4h}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -609,7 +794,12 @@ export default function App() {
               </div>
               <div className="space-y-3">
                 {(scan?.top_longs || []).map((item) => (
-                  <SignalCard key={`L-${item.symbol}`} item={item} onSelect={handleSelectStock} />
+                  <SignalCard
+                    key={`L-${item.symbol}`}
+                    item={item}
+                    timing={hourlyScan?.items?.[`${item.side}:${item.symbol}`]}
+                    onSelect={handleSelectStock}
+                  />
                 ))}
               </div>
             </section>
@@ -623,7 +813,12 @@ export default function App() {
               </div>
               <div className="space-y-3">
                 {(scan?.top_shorts || []).map((item) => (
-                  <SignalCard key={`S-${item.symbol}`} item={item} onSelect={handleSelectStock} />
+                  <SignalCard
+                    key={`S-${item.symbol}`}
+                    item={item}
+                    timing={hourlyScan?.items?.[`${item.side}:${item.symbol}`]}
+                    onSelect={handleSelectStock}
+                  />
                 ))}
               </div>
             </section>
@@ -961,6 +1156,28 @@ export default function App() {
                 <div className="text-sm font-mono font-bold text-rose-400">${selectedStock.stop_loss}</div>
               </div>
             </div>
+            {stockEntryTiming && stockEntryTiming.status === "OK" && (
+              <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-semibold text-slate-400">1H / 4H Entry Timing:</span>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                      stockEntryTiming.signal === "ENTER_NOW"
+                        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                        : stockEntryTiming.signal === "NEUTRAL_LIMIT"
+                          ? "bg-sky-500/20 text-sky-300 border-sky-500/40"
+                          : "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                    }`}
+                  >
+                    {stockEntryTiming.signal}
+                  </span>
+                  <span className="text-slate-300">{stockEntryTiming.reason}</span>
+                </div>
+                <div className="font-mono text-[11px] text-slate-300">
+                  Suggested Limit: <span className="text-sky-300 font-bold">${stockEntryTiming.suggested_entry}</span> · 1h RSI {stockEntryTiming.rsi_14_1h} · 4h RSI {stockEntryTiming.rsi_14_4h}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

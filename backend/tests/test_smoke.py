@@ -18,8 +18,8 @@ def main() -> None:
     assert h["status"] == "ok", h
 
     s = get_latest_scan()
-    assert 0 <= len(s["top_longs"]) <= 5, s
-    assert 0 <= len(s["top_shorts"]) <= 5, s
+    assert 0 <= len(s["top_longs"]) <= 10, s
+    assert 0 <= len(s["top_shorts"]) <= 10, s
     for card in s["top_longs"] + s["top_shorts"]:
         assert card["target_gain_pct"] >= 5.0, card
         assert len(card["drivers"]) > 0, card
