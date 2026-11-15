@@ -1254,6 +1254,113 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {backtest?.v3_eval?.variants && (
+                  <div className="space-y-4 pt-2">
+                    <div className="rounded-xl border border-sky-500/30 bg-slate-900/80 p-4 overflow-x-auto">
+                      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                        <div>
+                          <h3 className="text-sm font-bold text-sky-300">
+                            Claude Feedback V3 — 14-Fold Purged Walk-Forward A/B Comparison (2020–2026)
+                          </h3>
+                          <p className="text-[11px] text-slate-400">
+                            Pre-registered bar: NW t &gt; 3.0, D10−D1 CI &gt; 0, Paired vs 12-1 Mom CI &gt; 0 ({backtest.v3_eval.n_experiments} total experiments counted)
+                          </p>
+                        </div>
+                      </div>
+                      <table className="w-full text-xs">
+                        <thead className="text-slate-400 border-b border-slate-800">
+                          <tr>
+                            <th className="text-left py-1.5">Variant</th>
+                            <th className="text-right py-1.5">Daily IC (NW t)</th>
+                            <th className="text-right py-1.5">Rel IC (NW t)</th>
+                            <th className="text-right py-1.5">Folds IC&gt;0</th>
+                            <th className="text-right py-1.5">D10−D1 Spread</th>
+                            <th className="text-right py-1.5">Top-10 Long R (Lift)</th>
+                            <th className="text-right py-1.5">Paired vs Mom</th>
+                            <th className="text-right py-1.5">Passes Bar</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60 font-mono">
+                          {Object.entries(backtest.v3_eval.variants).map(([k, v]) => (
+                            <tr key={k}>
+                              <td className="py-1.5 font-sans text-slate-200">{v.label || k}</td>
+                              <td className="py-1.5 text-right text-slate-300">
+                                {v.daily_ic_mean} ({v.daily_ic_nw_t})
+                              </td>
+                              <td className="py-1.5 text-right text-slate-300">
+                                {v.ic_vs_relative_target} ({v.ic_vs_relative_nw_t})
+                              </td>
+                              <td className="py-1.5 text-right text-slate-300">{v.fold_ic_positive}</td>
+                              <td className="py-1.5 text-right text-slate-300">
+                                {v.spread_top_minus_bottom_r}R
+                              </td>
+                              <td className="py-1.5 text-right text-emerald-400">
+                                {v.top_k_long_r}R ({v.top_k_long_lift_r >= 0 ? "+" : ""}{v.top_k_long_lift_r}R)
+                              </td>
+                              <td className="py-1.5 text-right text-slate-300">
+                                {v.paired_vs_mom_r !== undefined
+                                  ? `${v.paired_vs_mom_r >= 0 ? "+" : ""}${v.paired_vs_mom_r}R`
+                                  : "—"}
+                              </td>
+                              <td className="py-1.5 text-right">
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-sans font-bold ${
+                                    v.passes_all
+                                      ? "bg-emerald-500/20 text-emerald-300"
+                                      : "bg-amber-500/15 text-amber-300"
+                                  }`}
+                                >
+                                  {v.passes_all ? "PASS" : "WATCHLIST ONLY"}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {backtest?.v3_eval?.selection_backtests && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-4 overflow-x-auto">
+                        <h3 className="text-sm font-bold text-white mb-2">
+                          V3 Portfolio Backtests (115 Non-Overlapping 15D Periods, 20 bps Round-Trip Cost · SPY Buy &amp; Hold: +153.4% / 14.55% CAGR)
+                        </h3>
+                        <table className="w-full text-xs">
+                          <thead className="text-slate-400 border-b border-slate-800">
+                            <tr>
+                              <th className="text-left py-1.5">Strategy</th>
+                              <th className="text-right py-1.5">Total Return</th>
+                              <th className="text-right py-1.5">CAGR</th>
+                              <th className="text-right py-1.5">Sharpe</th>
+                              <th className="text-right py-1.5">Max DD</th>
+                              <th className="text-right py-1.5">Avg Long R</th>
+                              <th className="text-right py-1.5">Beta-Adj Excess / 15D [95% CI]</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60 font-mono">
+                            {Object.entries(backtest.v3_eval.selection_backtests).map(([k, v]) => (
+                              <tr key={k}>
+                                <td className="py-1.5 font-sans text-slate-200">{k}</td>
+                                <td className="py-1.5 text-right text-emerald-400">
+                                  {v.strategy?.total_return_pct >= 0 ? "+" : ""}
+                                  {v.strategy?.total_return_pct}%
+                                </td>
+                                <td className="py-1.5 text-right text-slate-200">{v.strategy?.cagr_pct}%</td>
+                                <td className="py-1.5 text-right text-slate-200">{v.strategy?.sharpe}</td>
+                                <td className="py-1.5 text-right text-rose-400">{v.strategy?.max_dd_pct}%</td>
+                                <td className="py-1.5 text-right text-slate-300">{v.avg_long_r}R</td>
+                                <td className="py-1.5 text-right text-slate-300">
+                                  {v.beta_adj_excess_per_period_pct >= 0 ? "+" : ""}
+                                  {v.beta_adj_excess_per_period_pct}% [{v.beta_adj_excess_ci95?.[0]}%, {v.beta_adj_excess_ci95?.[1]}%]
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

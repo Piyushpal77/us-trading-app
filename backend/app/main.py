@@ -445,12 +445,22 @@ def get_stock_detail(symbol: str, days: int = 120) -> dict[str, Any]:
 
 @app.get("/api/backtest")
 def get_backtest() -> dict[str, Any]:
+    v3_eval: dict[str, Any] = {}
+    v3_path = DATA_DIR / "v3" / "results.json"
+    if v3_path.exists():
+        try:
+            import json as _json
+
+            v3_eval = _json.loads(v3_path.read_text(encoding="utf-8"))
+        except Exception:
+            v3_eval = {}
     if state.artifacts is None:
-        return {"equity_curve": [], "metrics": {}, "feature_importance": []}
+        return {"equity_curve": [], "metrics": {}, "feature_importance": [], "v3_eval": v3_eval}
     return {
         "equity_curve": state.artifacts.backtest.get("equity_curve", []),
         "metrics": state.artifacts.backtest.get("metrics", {}),
         "screener_eval": state.artifacts.backtest.get("screener_eval", {}),
+        "v3_eval": v3_eval,
         "feature_importance": state.artifacts.feature_importance,
         "trained_at": state.artifacts.trained_at,
         "data_mode": state.artifacts.data_mode,
