@@ -76,9 +76,15 @@ def _fit_calibrated_3class(
     if len(u_dates) < 40:
         model = _make_lgbm()
         model.fit(tr_df[FEATURE_COLS], tr_df[target_col].astype(int))
-        to_mask = tr_df[target_col].astype(int) == 1
-        e_to_r = float(tr_df.loc[to_mask, ret_col].mean()) if to_mask.any() else 0.0
-        return model, [], e_to_r
+        to_mask = tr_df[target_col].astype(int).to_numpy() == 1
+        if to_mask.any():
+            risk_pct = (cfg.stop_atr_mult * (tr_df["atr_14"] / tr_df["close"])).to_numpy(dtype=float)
+            to_rets = tr_df[ret_col].to_numpy(dtype=float)[to_mask]
+            to_risks = np.maximum(risk_pct[to_mask], 1e-6)
+            e_to_r = float(np.nanmean(to_rets / to_risks))
+        else:
+            e_to_r = 0.0
+        return model, [], e_to_r if np.isfinite(e_to_r) else 0.0
 
     cal_idx = int(len(u_dates) * 0.80)
     fit_end_idx = max(10, cal_idx - cfg.horizon_days)
@@ -101,7 +107,13 @@ def _fit_calibrated_3class(
             calibrators.append(ir)
 
     to_mask = y_cal == 1
-    e_to_r = float(tr_cal.loc[to_mask, ret_col].mean()) if to_mask.any() else 0.0
+    if to_mask.any():
+        risk_pct = (cfg.stop_atr_mult * (tr_cal["atr_14"] / tr_cal["close"])).to_numpy(dtype=float)
+        to_rets = tr_cal[ret_col].to_numpy(dtype=float)[to_mask]
+        to_risks = np.maximum(risk_pct[to_mask], 1e-6)
+        e_to_r = float(np.nanmean(to_rets / to_risks))
+    else:
+        e_to_r = 0.0
     if not np.isfinite(e_to_r):
         e_to_r = 0.0
     return model, calibrators, e_to_r

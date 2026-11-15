@@ -213,6 +213,9 @@ def compute_screener_evaluation(
                     daily_s_ics.append(ic_ds)
 
     lgbm_l_date_r: list[float] = []
+    base_l_date_r: list[float] = []
+    lgbm_s_date_r: list[float] = []
+    base_s_date_r: list[float] = []
     lr_l_date_r: list[float] = []
     mom_l_date_r: list[float] = []
 
@@ -240,6 +243,7 @@ def compute_screener_evaluation(
             lgbm_l_hits.extend(top_l["y_long"].tolist())
             lgbm_l_rs.extend(top_l["long_r"].tolist())
             lgbm_l_date_r.append(float(top_l["long_r"].mean()))
+            base_l_date_r.append(b_l_r)
             lift_l = (float(top_l["y_long"].mean()) - b_l_hit) * 100.0
             long_lifts.append(lift_l)
             f_rec["l_top"].extend(top_l["y_long"].tolist())
@@ -260,6 +264,8 @@ def compute_screener_evaluation(
             if not top_s.empty:
                 lgbm_s_hits.extend(top_s["y_short"].tolist())
                 lgbm_s_rs.extend(top_s["short_r"].tolist())
+                lgbm_s_date_r.append(float(top_s["short_r"].mean()))
+                base_s_date_r.append(float(s_pool["short_r"].mean()))
                 lift_s = (float(top_s["y_short"].mean()) - b_s_hit) * 100.0
                 short_lifts.append(lift_s)
                 f_rec["s_top"].extend(top_s["y_short"].tolist())
@@ -383,7 +389,27 @@ def compute_screener_evaluation(
         pass
 
     brier_long = round(float(brier_score_loss(work["y_long"].astype(int), work["prob_long"].clip(0.0, 1.0))), 4)
-    brier_short = round(float(brier_score_loss(work["y_short"].astype(int), work["prob_short"].clip(0.0, 1.0))), 4)
+    p_base_l = float(work["y_long"].mean())
+    brier_ref_l = p_base_l * (1.0 - p_base_l)
+    bss_long = round(1.0 - brier_long / brier_ref_l, 4) if brier_ref_l > 0 else 0.0
+
+    s_work = work[work["is_shortable"]]
+    if not s_work.empty:
+        brier_short = round(float(brier_score_loss(s_work["y_short"].astype(int), s_work["prob_short"].clip(0.0, 1.0))), 4)
+        p_base_s = float(s_work["y_short"].mean())
+    else:
+        brier_short = 0.0
+        p_base_s = 0.0
+    brier_ref_s = p_base_s * (1.0 - p_base_s)
+    bss_short = round(1.0 - brier_short / brier_ref_s, 4) if brier_ref_s > 0 else 0.0
+
+    avg_r_l = round(float(np.mean(lgbm_l_rs)), 3) if lgbm_l_rs else 0.0
+    base_avg_r_l = round(float(np.mean(base_l_rs)), 3) if base_l_rs else 0.0
+    avg_r_lift_l = _paired_bootstrap_diff(lgbm_l_date_r, base_l_date_r)
+
+    avg_r_s = round(float(np.mean(lgbm_s_rs)), 3) if lgbm_s_rs else 0.0
+    base_avg_r_s = round(float(np.mean(base_s_rs)), 3) if base_s_rs else 0.0
+    avg_r_lift_s = _paired_bootstrap_diff(lgbm_s_date_r, base_s_date_r)
 
     return {
         "rebalance_dates": int(len(rebal_dates)),
@@ -393,9 +419,12 @@ def compute_screener_evaluation(
             "lift_pp": round(top_l_pct - base_l_pct, 1),
             "lift_ratio": round(top_l_pct / max(0.1, base_l_pct), 2),
             "lift_ci_95": _bootstrap_ci(long_lifts, n_boot=n_bootstrap),
-            "avg_r": round(float(np.mean(lgbm_l_rs)), 3) if lgbm_l_rs else 0.0,
-            "base_avg_r": round(float(np.mean(base_l_rs)), 3) if base_l_rs else 0.0,
+            "avg_r": avg_r_l,
+            "base_avg_r": base_avg_r_l,
+            "avg_r_lift": round(avg_r_l - base_avg_r_l, 3),
+            "avg_r_lift_ci_95": avg_r_lift_l["ci_95"],
             "brier_score": brier_long,
+            "brier_skill_score": bss_long,
             "rank_ic": _ic_stats(long_ics),
             "daily_ic_nw": _newey_west_ic(daily_l_ics, max_lag=max(5, cfg.horizon_days)),
             "folds_beating_base": f"{l_beats}/{len(per_fold)}",
@@ -406,9 +435,12 @@ def compute_screener_evaluation(
             "lift_pp": round(top_s_pct - base_s_pct, 1),
             "lift_ratio": round(top_s_pct / max(0.1, base_s_pct), 2),
             "lift_ci_95": _bootstrap_ci(short_lifts, n_boot=n_bootstrap),
-            "avg_r": round(float(np.mean(lgbm_s_rs)), 3) if lgbm_s_rs else 0.0,
-            "base_avg_r": round(float(np.mean(base_s_rs)), 3) if base_s_rs else 0.0,
+            "avg_r": avg_r_s,
+            "base_avg_r": base_avg_r_s,
+            "avg_r_lift": round(avg_r_s - base_avg_r_s, 3),
+            "avg_r_lift_ci_95": avg_r_lift_s["ci_95"],
             "brier_score": brier_short,
+            "brier_skill_score": bss_short,
             "rank_ic": _ic_stats(short_ics),
             "daily_ic_nw": _newey_west_ic(daily_s_ics, max_lag=max(5, cfg.horizon_days)),
             "folds_beating_base": f"{s_beats}/{len(per_fold)}",
@@ -451,8 +483,8 @@ def compute_screener_evaluation(
                 "short_ic": 0.0,
             },
         },
-        "deciles_long": _decile_table(work, "prob_long", "y_long", "long_r"),
-        "deciles_short": _decile_table(work[work["is_shortable"]], "prob_short", "y_short", "short_r"),
+        "deciles_long": _decile_table(work, long_score_col, "y_long", "long_r"),
+        "deciles_short": _decile_table(work[work["is_shortable"]], short_score_col, "y_short", "short_r"),
         "per_fold": per_fold,
         "vol_buckets": vol_buckets,
     }

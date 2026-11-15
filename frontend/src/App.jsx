@@ -1151,8 +1151,10 @@ export default function App() {
                     </div>
                     <div className="text-[11px] text-slate-400">
                       Avg R: {backtest.screener_eval.long_summary.avg_r} vs {backtest.screener_eval.long_summary.base_avg_r} base
+                      {backtest.screener_eval.long_summary.avg_r_lift_ci_95 &&
+                        ` (Lift ${backtest.screener_eval.long_summary.avg_r_lift >= 0 ? "+" : ""}${backtest.screener_eval.long_summary.avg_r_lift}R [${backtest.screener_eval.long_summary.avg_r_lift_ci_95[0]}, ${backtest.screener_eval.long_summary.avg_r_lift_ci_95[1]}])`}
                       {backtest.screener_eval.long_summary.brier_score !== undefined &&
-                        ` · Brier ${backtest.screener_eval.long_summary.brier_score}`}
+                        ` · Brier ${backtest.screener_eval.long_summary.brier_score} (BSS ${backtest.screener_eval.long_summary.brier_skill_score ?? 0})`}
                     </div>
                   </div>
                   <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
@@ -1162,8 +1164,10 @@ export default function App() {
                     </div>
                     <div className="text-[11px] text-slate-400">
                       Avg R: {backtest.screener_eval.short_summary.avg_r} vs {backtest.screener_eval.short_summary.base_avg_r} base
+                      {backtest.screener_eval.short_summary.avg_r_lift_ci_95 &&
+                        ` (Lift ${backtest.screener_eval.short_summary.avg_r_lift >= 0 ? "+" : ""}${backtest.screener_eval.short_summary.avg_r_lift}R [${backtest.screener_eval.short_summary.avg_r_lift_ci_95[0]}, ${backtest.screener_eval.short_summary.avg_r_lift_ci_95[1]}])`}
                       {backtest.screener_eval.short_summary.brier_score !== undefined &&
-                        ` · Brier ${backtest.screener_eval.short_summary.brier_score}`}
+                        ` · Brier ${backtest.screener_eval.short_summary.brier_score} (BSS ${backtest.screener_eval.short_summary.brier_skill_score ?? 0})`}
                     </div>
                   </div>
                 </div>
