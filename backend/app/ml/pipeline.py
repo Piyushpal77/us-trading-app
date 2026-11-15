@@ -14,7 +14,7 @@ import pandas as pd
 import shap
 from sklearn.isotonic import IsotonicRegression
 
-from app.config import MODELS_DIR, ScreenerConfig
+from app.config import DATA_DIR, MODELS_DIR, ScreenerConfig
 from app.data.universe import UniverseMember
 from app.features.indicators import FEATURE_COLS, FEATURE_LABELS, compute_features
 from app.ml.evaluation import compute_screener_evaluation, train_logreg_fold
@@ -498,6 +498,7 @@ def scan_latest(
     meta_map = {m.symbol: m for m in universe}
     latest_rows: list[pd.Series] = []
     latest_date: pd.Timestamp | None = None
+    ret60_map: dict[str, pd.Series] = {}
 
     for sym, df in history.items():
         if len(df) < 120:
@@ -512,9 +513,13 @@ def scan_latest(
         last["symbol"] = sym
         m = meta_map.get(sym)
         last["name"] = m.name if m else sym
-        last["sector"] = m.sector if m else "Equities"
+        sec = m.sector if m else "Equities"
+        last["sector"] = "Information Technology" if sec == "Technology" else sec
         last["index_membership"] = m.index_membership if m else "SP500"
         last["is_shortable"] = bool(m.is_shortable) if m else True
+        close_s = df["close"].astype(float)
+        last["mom_12_1"] = float(close_s.iloc[-22] / close_s.iloc[-252] - 1.0) if len(close_s) >= 252 else float(last.get("ret_60d", 0.0))
+        ret60_map[sym] = close_s.pct_change().tail(60)
         latest_rows.append(last)
 
     if not latest_rows:
@@ -528,9 +533,35 @@ def scan_latest(
         }
 
     snap = pd.DataFrame(latest_rows).reset_index(drop=True)
-    liquid = snap[snap["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m].copy()
+
+    # Attach days_to_earn from earnings_dates.csv when available
+    earn_path = DATA_DIR / "earnings_dates.csv"
+    ref_d64 = np.datetime64((latest_date or pd.Timestamp.now()).strftime("%Y-%m-%d"), "D")
+    if earn_path.exists():
+        try:
+            ed_df = pd.read_csv(earn_path, parse_dates=["earnings_date"])
+            ed_map: dict[str, int | None] = {}
+            for s, g in ed_df.groupby("symbol"):
+                ev = g["earnings_date"].values.astype("datetime64[D]")
+                fut = ev[ev >= ref_d64]
+                ed_map[str(s)] = int(np.busday_count(ref_d64, fut.min())) if len(fut) else None
+            snap["days_to_earn"] = [ed_map.get(str(s), np.nan) for s in snap["symbol"]]
+        except Exception:
+            snap["days_to_earn"] = np.nan
+    else:
+        snap["days_to_earn"] = np.nan
+
+    min_dvol = max(float(cfg.min_avg_dollar_vol_m), 100.0) if len(snap) >= 100 else float(cfg.min_avg_dollar_vol_m)
+    liquid = snap[(snap["avg_dollar_vol_m"] >= min_dvol) & (snap["close"] >= 10.0)].copy()
+    if liquid.empty:
+        liquid = snap[snap["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m].copy()
     if liquid.empty:
         liquid = snap.copy()
+
+    # Earnings blackout: exclude picks with earnings within the next 15 trading days
+    no_earn_blackout = liquid[~((liquid["days_to_earn"] >= 0) & (liquid["days_to_earn"] <= 15))].copy()
+    if len(no_earn_blackout) >= cfg.top_k * 2:
+        liquid = no_earn_blackout
 
     p_sl_l, p_to_l, p_tp_l, ev_l = _predict_calibrated_ev(
         artifacts.model_long, artifacts.cal_long, artifacts.e_to_r_long, liquid[FEATURE_COLS], cfg
@@ -547,15 +578,64 @@ def scan_latest(
     liquid["p_to_short"] = p_to_s
     liquid["ev_short"] = ev_s
 
+    # Load V3 ensemble rank score when available for the scan date; otherwise blend cross-sectional EV + 12-1 momentum
+    v3_oos_path = DATA_DIR / "v3" / "oos_preds.parquet"
+    v3_ens_map: dict[str, float] = {}
+    if v3_oos_path.exists() and latest_date is not None and scan_mode == "LIVE_EOD":
+        try:
+            v3_sub = pd.read_parquet(v3_oos_path, columns=["date", "symbol", "ens"])
+            v3_sub = v3_sub[pd.to_datetime(v3_sub["date"]) == pd.Timestamp(latest_date).normalize()]
+            v3_ens_map = dict(zip(v3_sub["symbol"].astype(str), v3_sub["ens"].astype(float)))
+        except Exception:
+            v3_ens_map = {}
+
+    if v3_ens_map:
+        liquid["v3_ens"] = [v3_ens_map.get(str(s), np.nan) for s in liquid["symbol"]]
+    else:
+        liquid["v3_ens"] = np.nan
+
+    fallback_ens = 0.65 * liquid["ev_long"].rank(pct=True) + 0.35 * liquid["mom_12_1"].rank(pct=True)
+    liquid["v3_ens"] = liquid["v3_ens"].fillna(fallback_ens)
+
     rr = cfg.target_atr_mult / cfg.stop_atr_mult
-    liquid["score_long"] = np.maximum(0.0, liquid["ev_long"]) * 100.0
-    liquid["score_short"] = np.maximum(0.0, liquid["ev_short"]) * 100.0
+    liquid["score_long"] = np.round(liquid["v3_ens"] * 100.0, 1)
+    liquid["score_short"] = np.round((1.0 - liquid["v3_ens"]) * 100.0, 1)
     liquid["target_gain_pct"] = (cfg.target_atr_mult * liquid["atr_14"] / liquid["close"]) * 100.0
 
     eligible = liquid[liquid["target_gain_pct"] >= cfg.min_target_gain_pct].copy()
     if not eligible.empty:
-        eligible["pct_rank_long"] = eligible["ev_long"].rank(pct=True)
-        eligible["pct_rank_short"] = eligible["ev_short"].rank(pct=True)
+        eligible["pct_rank_long"] = eligible["v3_ens"].rank(pct=True)
+        eligible["pct_rank_short"] = (1.0 - eligible["v3_ens"]).rank(pct=True)
+
+    def _diversified_select(cands: pd.DataFrame, k: int, max_per_sector: int = 2, max_corr: float = 0.80) -> pd.DataFrame:
+        if cands.empty:
+            return cands
+        chosen_idx: list[int] = []
+        chosen_syms: list[str] = []
+        sec_counts: dict[str, int] = {}
+        for idx, r in cands.iterrows():
+            if len(chosen_idx) >= k:
+                break
+            sec = str(r["sector"])
+            if sec_counts.get(sec, 0) >= max_per_sector:
+                continue
+            sym = str(r["symbol"])
+            s_ret = ret60_map.get(sym)
+            if chosen_syms and s_ret is not None and len(s_ret) >= 20:
+                too_corr = False
+                for csym in chosen_syms:
+                    cret = ret60_map.get(csym)
+                    if cret is not None and len(cret) >= 20:
+                        corr = float(s_ret.corr(cret))
+                        if np.isfinite(corr) and abs(corr) > max_corr:
+                            too_corr = True
+                            break
+                if too_corr:
+                    continue
+            chosen_idx.append(idx)
+            chosen_syms.append(sym)
+            sec_counts[sec] = sec_counts.get(sec, 0) + 1
+        return cands.loc[chosen_idx]
 
     exp_long = shap.TreeExplainer(artifacts.model_long)
     exp_short = shap.TreeExplainer(artifacts.model_short)
@@ -585,6 +665,7 @@ def scan_latest(
             drivers = _extract_top_shap(exp_short, row[FEATURE_COLS].to_frame().T)
 
         target_gain_pct = ((tp - entry) / entry * 100.0) if side == "LONG" else ((entry - tp) / entry * 100.0)
+        d2e = row.get("days_to_earn", np.nan)
         return {
             "rank": rank,
             "symbol": str(row["symbol"]),
@@ -601,6 +682,7 @@ def scan_latest(
             "p_tp_pct": round(prob * 100, 1),
             "p_sl_pct": round(p_sl * 100, 1),
             "p_to_pct": round(p_to * 100, 1),
+            "days_to_earn": int(d2e) if pd.notna(d2e) and np.isfinite(d2e) else None,
             "expected_rr": round(rr, 2),
             "target_gain_pct": round(target_gain_pct, 2),
             "entry": round(entry, 2),
@@ -614,11 +696,19 @@ def scan_latest(
         }
 
     long_pool = eligible[eligible["prob_long"] >= cfg.min_win_prob] if not eligible.empty else pd.DataFrame()
-    top_l_df = long_pool.nlargest(cfg.top_k, "ev_long") if not long_pool.empty else pd.DataFrame()
+    top_l_df = (
+        _diversified_select(long_pool.sort_values("v3_ens", ascending=False).head(80), cfg.top_k)
+        if not long_pool.empty
+        else pd.DataFrame()
+    )
     top_longs = [_build_card(r, "LONG", i + 1) for i, (_, r) in enumerate(top_l_df.iterrows())]
 
     short_pool = eligible[(eligible["is_shortable"]) & (eligible["prob_short"] >= cfg.min_win_prob)] if not eligible.empty else pd.DataFrame()
-    top_s_df = short_pool.nlargest(cfg.top_k, "ev_short") if not short_pool.empty else pd.DataFrame()
+    top_s_df = (
+        _diversified_select(short_pool.sort_values("v3_ens", ascending=True).head(80), cfg.top_k)
+        if not short_pool.empty
+        else pd.DataFrame()
+    )
     top_shorts = [_build_card(r, "SHORT", i + 1) for i, (_, r) in enumerate(top_s_df.iterrows())]
 
     holdings_alerts: list[dict[str, Any]] = []

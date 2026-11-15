@@ -96,10 +96,15 @@ def _trading_day_distance(dates: pd.DatetimeIndex, events: np.ndarray) -> tuple[
     n = len(dates)
     to_next = np.full(n, np.nan)
     since_last = np.full(n, np.nan)
-    if events.size == 0:
+    if events.size == 0 or n == 0:
         return to_next, since_last
-    pos = np.searchsorted(dates.values, events)  # index of first trading date >= event
-    pos = np.unique(pos)
+    future_bdays = pd.bdate_range(dates[-1] + pd.Timedelta(days=1), periods=120)
+    full_dates = dates.union(future_bdays)
+    n_full = len(full_dates)
+    pos = np.searchsorted(full_dates.values, events)  # index of first trading date >= event
+    pos = np.unique(pos[pos < n_full])
+    if pos.size == 0:
+        return to_next, since_last
     idx = np.arange(n)
     nxt = np.searchsorted(pos, idx, side="left")
     has_next = nxt < len(pos)
@@ -107,7 +112,6 @@ def _trading_day_distance(dates: pd.DatetimeIndex, events: np.ndarray) -> tuple[
     prv = nxt - 1
     has_prev = prv >= 0
     since_last[has_prev] = idx[has_prev] - pos[prv[has_prev]]
-    # events beyond the downloaded history are unknown; cap "to next" at 70 trading days
     to_next = np.where(to_next > 70, np.nan, to_next)
     return to_next, since_last
 

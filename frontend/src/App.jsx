@@ -121,6 +121,7 @@ function SignalCard({ item, timing, onSelect }) {
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
             {item.sector} · Avg Vol ${item.avg_dollar_vol_m}M/day
+            {item.days_to_earn !== undefined && item.days_to_earn !== null && ` · Earnings in ${item.days_to_earn}d`}
           </p>
         </div>
 
