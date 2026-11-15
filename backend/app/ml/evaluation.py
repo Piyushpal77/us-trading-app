@@ -36,11 +36,10 @@ def _bootstrap_ci(vals: list[float], n_boot: int = 500, seed: int = 42) -> list[
 def _decile_table(df: pd.DataFrame, prob_col: str, y_col: str, r_col: str) -> list[dict[str, Any]]:
     if df.empty or len(df) < 50:
         return []
-    work = df[[prob_col, y_col, r_col]].dropna().copy()
-    try:
-        work["decile"] = pd.qcut(work[prob_col].rank(method="first"), 10, labels=list(range(1, 11)))
-    except Exception:
-        return []
+    work = df[["date", prob_col, y_col, r_col]].dropna().copy()
+    # Rank within each date first so deciles measure cross-sectional stock selection, not date effects
+    work["pct_rank"] = work.groupby("date")[prob_col].rank(pct=True, method="first")
+    work["decile"] = np.ceil(work["pct_rank"] * 10.0).clip(1, 10).astype(int)
     rows = []
     for d in range(1, 11):
         sub = work[work["decile"] == d]
@@ -133,7 +132,8 @@ def compute_screener_evaluation(
     work["mom_12_1"] = [mom_map.get((str(s), pd.Timestamp(d)), np.nan) for s, d in zip(work["symbol"], work["date"])]
 
     unique_dates = np.sort(work["date"].unique())
-    rebal_dates = unique_dates[::5]
+    # Use non-overlapping horizon_days steps so Rank IC t-stats and bootstrap CIs are independent
+    rebal_dates = unique_dates[:: max(1, cfg.horizon_days)]
 
     long_ics: list[float] = []
     short_ics: list[float] = []
@@ -288,15 +288,21 @@ def compute_screener_evaluation(
             }
         )
 
-    # Volatility bucket check (ATR% tertiles)
+    # Within-date volatility bucket check (ATR% tertiles)
     vol_buckets = []
     try:
-        work["vol_bucket"] = pd.qcut(work["atr_pct"], 3, labels=["Low Vol", "Mid Vol", "High Vol"])
+        work["vol_pct_rank"] = work.groupby("date")["atr_pct"].rank(pct=True, method="first")
+        work["vol_bucket"] = np.where(
+            work["vol_pct_rank"] <= 1.0 / 3.0,
+            "Low Vol",
+            np.where(work["vol_pct_rank"] <= 2.0 / 3.0, "Mid Vol", "High Vol"),
+        )
+        work["prob_pct_rank_date"] = work.groupby(["date", "vol_bucket"])["prob_long"].rank(pct=True, method="first")
         for vb in ["Low Vol", "Mid Vol", "High Vol"]:
             sub = work[work["vol_bucket"] == vb]
             if sub.empty:
                 continue
-            top_sub = sub[sub["prob_long"] >= sub["prob_long"].quantile(0.9)]
+            top_sub = sub[sub["prob_pct_rank_date"] >= 0.9]
             vol_buckets.append(
                 {
                     "bucket": vb,

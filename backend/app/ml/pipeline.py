@@ -96,6 +96,10 @@ def build_panel_dataset(
             )
             feats = pd.concat([feats, labels], axis=1)
 
+        # Drop warm-up rows so ema200 and 52-week features are fully stabilized
+        if len(feats) > 260:
+            feats = feats.iloc[252:]
+
         frames.append(feats.reset_index(drop=True))
 
     if not frames:
@@ -108,6 +112,7 @@ def run_walk_forward_backtest(
     benchmark_df: pd.DataFrame,
     cfg: ScreenerConfig,
     n_splits: int = 6,
+    history: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     valid = panel.dropna(subset=["y_long", "y_short", "atr_14"]).copy()
     valid = valid[valid["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m]
@@ -133,8 +138,10 @@ def run_walk_forward_backtest(
 
     for s in range(n_splits):
         train_end_idx = max(0, split_points[s] - cfg.horizon_days)
-        test_start_idx = split_points[s]
+        test_start_idx = split_points[s] + (1 if s > 0 else 0)
         test_end_idx = split_points[s + 1]
+        if test_start_idx > test_end_idx:
+            continue
 
         train_cutoff = unique_dates[train_end_idx]
         test_start = unique_dates[test_start_idx]
@@ -165,7 +172,7 @@ def run_walk_forward_backtest(
 
     oos = pd.concat(oos_preds, ignore_index=True)
     oos_dates = np.sort(oos["date"].unique())
-    rebal_dates = oos_dates[:: max(5, cfg.horizon_days // 2)]
+    rebal_dates = oos_dates[:: max(1, cfg.horizon_days)]
 
     equity = 100.0
     peak = 100.0
@@ -225,7 +232,7 @@ def run_walk_forward_backtest(
     losses = [-r for r in all_rets if r <= 0]
     pf = (sum(wins) / sum(losses)) if losses and sum(losses) > 0 else 2.0
 
-    screener_eval = compute_screener_evaluation(oos, None, cfg, panel=valid)
+    screener_eval = compute_screener_evaluation(oos, history, cfg, panel=None if history else valid)
 
     return {
         "equity_curve": curve,
@@ -253,7 +260,7 @@ def train_and_save_models(
     if panel.empty:
         raise ValueError("No sufficient historical data to train models.")
 
-    backtest = run_walk_forward_backtest(panel, benchmark_df, cfg)
+    backtest = run_walk_forward_backtest(panel, benchmark_df, cfg, history=history)
 
     valid = panel.dropna(subset=["y_long", "y_short", "atr_14"]).copy()
     valid = valid[valid["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m]

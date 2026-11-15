@@ -147,6 +147,13 @@ def fetch_us_universe(limit: int = 550) -> list[UniverseMember]:
             )
         return members
 
+    import warnings
+
+    warnings.warn(
+        "Failed to fetch live S&P 500 and Nasdaq 100 constituents; falling back to small built-in sample list.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     return [
         UniverseMember(
             symbol=s,

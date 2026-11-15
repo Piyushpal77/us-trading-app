@@ -8,11 +8,12 @@ def compute_triple_barrier_labels(
     df: pd.DataFrame,
     atr: pd.Series,
     target_atr_mult: float = 2.5,
-    stop_atr_mult: float = 1.5,
+    stop_atr_mult: float = 2.0,
     horizon_days: int = 15,
 ) -> pd.DataFrame:
-    """Compute forward Triple-Barrier outcomes for both Long and Short setups."""
+    """Compute forward Triple-Barrier outcomes for both Long and Short setups with gap-realistic fills."""
     n = len(df)
+    opens = df["open"].to_numpy(dtype=float) if "open" in df.columns else df["close"].to_numpy(dtype=float)
     closes = df["close"].to_numpy(dtype=float)
     highs = df["high"].to_numpy(dtype=float)
     lows = df["low"].to_numpy(dtype=float)
@@ -42,30 +43,35 @@ def compute_triple_barrier_labels(
         l_done = False
         s_done = False
         for j in range(i + 1, i + horizon_days + 1):
+            op = opens[j]
             hi = highs[j]
             lo = lows[j]
             if not l_done:
                 hit_sl = lo <= l_sl
                 hit_tp = hi >= l_tp
                 if hit_sl:
+                    fill_px = min(op, l_sl)
                     l_outcome = 0.0
-                    l_r = (l_sl - entry) / entry
+                    l_r = (fill_px - entry) / entry
                     l_done = True
                 elif hit_tp:
+                    fill_px = max(op, l_tp)
                     l_outcome = 1.0
-                    l_r = (l_tp - entry) / entry
+                    l_r = (fill_px - entry) / entry
                     l_done = True
 
             if not s_done:
                 hit_sl = hi >= s_sl
                 hit_tp = lo <= s_tp
                 if hit_sl:
+                    fill_px = max(op, s_sl)
                     s_outcome = 0.0
-                    s_r = (entry - s_sl) / entry
+                    s_r = (entry - fill_px) / entry
                     s_done = True
                 elif hit_tp:
+                    fill_px = min(op, s_tp)
                     s_outcome = 1.0
-                    s_r = (entry - s_tp) / entry
+                    s_r = (entry - fill_px) / entry
                     s_done = True
 
             if l_done and s_done:

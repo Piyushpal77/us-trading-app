@@ -41,6 +41,7 @@ class MarketDataAdapter(ABC):
         history: dict[str, pd.DataFrame],
         quotes: dict[str, dict[str, float]],
         trade_date: pd.Timestamp | None = None,
+        volume_scale_1550: float = 1.087,
     ) -> dict[str, pd.DataFrame]:
         """
         Overlay a 3:50 PM ET live quote snapshot onto historical EOD bars
@@ -60,7 +61,7 @@ class MarketDataAdapter(ABC):
                         "high": float(q["high"]),
                         "low": float(q["low"]),
                         "close": float(q["ltp"]),
-                        "volume": float(q["volume"]),
+                        "volume": float(q["volume"]) * volume_scale_1550,
                     }
                 ],
                 index=pd.DatetimeIndex([bar_date], name="date"),
@@ -200,6 +201,18 @@ class YFinanceUSAdapter(MarketDataAdapter):
             max_dates = dict(
                 conn.execute("SELECT symbol, MAX(date) FROM ohlcv GROUP BY symbol").fetchall()
             )
+            # Detect large single-day jumps (>40%) in cached history that may indicate unadjusted splits
+            jump_syms = {
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT DISTINCT symbol FROM (
+                        SELECT symbol, close, LAG(close) OVER (PARTITION BY symbol ORDER BY date) AS prev_c
+                        FROM ohlcv
+                    ) WHERE prev_c > 0 AND ABS(close - prev_c) / prev_c > 0.40
+                    """
+                ).fetchall()
+            }
 
         inc_symbols: list[str] = []
         full_symbols: list[str] = []
@@ -207,7 +220,7 @@ class YFinanceUSAdapter(MarketDataAdapter):
 
         for sym in symbols:
             last_dt_str = max_dates.get(sym)
-            if last_dt_str:
+            if last_dt_str and sym not in jump_syms:
                 last_dt = datetime.strptime(last_dt_str, "%Y-%m-%d").date()
                 cand_start = last_dt - timedelta(days=3)
                 if cand_start < oldest_inc_start:

@@ -75,7 +75,11 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def compute_features(df: pd.DataFrame, benchmark_df: pd.DataFrame | None = None) -> pd.DataFrame:
+def compute_features(
+    df: pd.DataFrame,
+    benchmark_df: pd.DataFrame | None = None,
+    allow_empty_benchmark: bool = False,
+) -> pd.DataFrame:
     """
     Compute leak-free daily technical, volume, volatility-squeeze, and relative-strength
     features. Safe for both historical EOD bars and 3:50 PM ET provisional bars.
@@ -174,6 +178,10 @@ def compute_features(df: pd.DataFrame, benchmark_df: pd.DataFrame | None = None)
         rs_line = close / b_close.replace(0.0, np.nan)
         out["rs_slope_10"] = rs_line.pct_change(10)
     else:
+        if not allow_empty_benchmark:
+            raise ValueError(
+                "benchmark_df is empty — refusing to fall back to raw returns for relative strength features."
+            )
         warnings.warn(
             "benchmark_df is empty — relative strength features (rs_5d, rs_20d, rs_60d, rs_slope_10) are falling back to raw returns.",
             RuntimeWarning,

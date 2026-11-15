@@ -89,16 +89,19 @@ def main() -> None:
         blind_rets.append(ret_b)
         blind_hits += hit_b
 
-        # 2. Hourly entry timing: wait up to 2 trading days (14 1h bars) for 1h RSI <= 62 & near EMA20
+        # 2. Hourly entry timing: start strictly AFTER signal-day 16:00 ET close, match production rules
         h_df = hourly_cache.get(sym)
         if h_df is None:
             continue
         h_idx_naive = h_df.index.tz_localize(None) if h_df.index.tz is not None else h_df.index
-        h_fwd = h_df[h_idx_naive > dt].iloc[:14]
+        signal_close_ts = pd.Timestamp(dt).normalize() + pd.Timedelta(hours=16)
+        h_fwd = h_df[h_idx_naive > signal_close_ts].iloc[:14]
         entry_t = None
         entry_ts = None
         for ts, hbar in h_fwd.iterrows():
-            if float(hbar["rsi_14_1h"]) <= 62.0 and float(hbar["dist_ema20_1h_pct"]) <= 0.8:
+            atr_1h = float(hbar["atr_14_1h"]) if "atr_14_1h" in hbar and np.isfinite(hbar["atr_14_1h"]) else 0.0
+            dist_atr = float(hbar["dist_ema20_1h_atr"]) if "dist_ema20_1h_atr" in hbar and np.isfinite(hbar["dist_ema20_1h_atr"]) else 99.0
+            if float(hbar["rsi_14_1h"]) <= 58.0 and dist_atr <= 0.75:
                 entry_t = float(hbar["close"])
                 entry_ts = ts.tz_localize(None) if ts.tzinfo is not None else ts
                 break
@@ -108,7 +111,8 @@ def main() -> None:
         timed_entries += 1
         tp_t = entry_t + DEFAULT_CONFIG.target_atr_mult * atr
         sl_t = entry_t - DEFAULT_CONFIG.stop_atr_mult * atr
-        fwd_after = df_d[df_d.index >= entry_ts.normalize()].iloc[: DEFAULT_CONFIG.horizon_days]
+        # Evaluate strictly on daily bars AFTER entry day (no same-day pre-entry high/low look-ahead)
+        fwd_after = df_d[df_d.index > entry_ts.normalize()].iloc[: DEFAULT_CONFIG.horizon_days]
         if fwd_after.empty:
             continue
         ret_t = (float(fwd_after.iloc[-1]["close"]) - entry_t) / entry_t

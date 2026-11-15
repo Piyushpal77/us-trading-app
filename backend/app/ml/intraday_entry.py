@@ -38,16 +38,16 @@ def fetch_hourly_bars(symbol: str, period: str = "60d") -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC").tz_convert(US_EASTERN)
     else:
         df.index = df.index.tz_convert(US_EASTERN)
-    # Drop partial in-progress 1h bar so RSI/EMA are computed on completed bars only
-    now_et = datetime.now(US_EASTERN)
+    # Drop partial in-progress 1h bar (yfinance stamps US bars at :30, so 10:30 covers 10:30..11:30)
+    now_et = pd.Timestamp.now(tz=US_EASTERN)
     last_ts = df.index[-1]
-    if last_ts.date() == now_et.date() and last_ts.hour == now_et.hour and len(df) > 1:
+    if last_ts + pd.Timedelta(hours=1) > now_et and len(df) > 1:
         df = df.iloc[:-1]
     return df
 
 
 def compute_hourly_indicators(df_1h: pd.DataFrame) -> pd.DataFrame:
-    """Compute 1h EMA(20), RSI(14), ATR(14), and 09:30-ET-aligned 4h-resampled RSI/EMA context."""
+    """Compute 1h EMA(20), RSI(14), ATR(14), and session-aligned 4h-resampled RSI/EMA context."""
     df = df_1h.copy()
     c = df["close"].astype(float)
     h = df["high"].astype(float)
@@ -59,13 +59,18 @@ def compute_hourly_indicators(df_1h: pd.DataFrame) -> pd.DataFrame:
     df["dist_ema20_1h_pct"] = (c / df["ema_20_1h"] - 1.0) * 100.0
     df["dist_ema20_1h_atr"] = (c - df["ema_20_1h"]) / df["atr_14_1h"].replace(0.0, np.nan)
 
-    # Align 4h resample to 09:30 ET session open so bars don't straddle sessions
+    # Bucket per US session date (09:30..13:29 -> bucket 0, 13:30..16:00 -> bucket 1) — DST & tz-safe
+    mins_since_open = np.maximum(0, df.index.hour * 60 + df.index.minute - 570)
+    session_bucket = mins_since_open // 240
     df_4h = (
         df[["open", "high", "low", "close", "volume"]]
-        .resample("4h", origin="1970-01-01 09:30:00")
+        .groupby([df.index.date, session_bucket], sort=True)
         .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
         .dropna()
     )
+    # Map each 4h bucket back to the last 1h timestamp in that bucket for forward-fill alignment
+    bucket_end_ts = df.index.to_series().groupby([df.index.date, session_bucket], sort=True).last()
+    df_4h.index = pd.DatetimeIndex(bucket_end_ts.loc[df_4h.index].values)
     if len(df_4h) >= 20:
         df_4h["ema_20_4h"] = df_4h["close"].ewm(span=20, adjust=False).mean()
         df_4h["rsi_14_4h"] = _compute_rsi(df_4h["close"], 14)
