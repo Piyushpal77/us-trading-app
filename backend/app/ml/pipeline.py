@@ -12,6 +12,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import shap
+from sklearn.isotonic import IsotonicRegression
 
 from app.config import MODELS_DIR, ScreenerConfig
 from app.data.universe import UniverseMember
@@ -23,20 +24,30 @@ from app.ml.labeling import compute_triple_barrier_labels
 US_EASTERN = ZoneInfo("America/New_York")
 
 
-def _grade_from_score(score: float) -> str:
-    if score >= 115:
+def _grade_from_ev(ev_r: float) -> str:
+    if ev_r >= 0.30:
         return "A+"
-    if score >= 95:
+    if ev_r >= 0.20:
         return "A"
-    if score >= 78:
+    if ev_r >= 0.12:
         return "B+"
-    if score >= 60:
+    if ev_r >= 0.05:
         return "B"
     return "C"
 
 
+def _conviction_tier(ev_r: float, pct_rank: float) -> str:
+    if ev_r >= 0.20 and pct_rank >= 0.90:
+        return "HIGH"
+    if ev_r >= 0.08:
+        return "MEDIUM"
+    return "LOW"
+
+
 def _make_lgbm() -> lgb.LGBMClassifier:
     return lgb.LGBMClassifier(
+        objective="multiclass",
+        num_class=3,
         n_estimators=220,
         learning_rate=0.04,
         num_leaves=31,
@@ -54,6 +65,76 @@ def _make_lgbm() -> lgb.LGBMClassifier:
     )
 
 
+def _fit_calibrated_3class(
+    tr_df: pd.DataFrame,
+    target_col: str,
+    ret_col: str,
+    cfg: ScreenerConfig,
+) -> tuple[lgb.LGBMClassifier, list[IsotonicRegression], float]:
+    """Fit 3-class LightGBM on tr_fit and isotonic calibrators on embargoed tr_cal."""
+    u_dates = np.sort(tr_df["date"].unique())
+    if len(u_dates) < 40:
+        model = _make_lgbm()
+        model.fit(tr_df[FEATURE_COLS], tr_df[target_col].astype(int))
+        to_mask = tr_df[target_col].astype(int) == 1
+        e_to_r = float(tr_df.loc[to_mask, ret_col].mean()) if to_mask.any() else 0.0
+        return model, [], e_to_r
+
+    cal_idx = int(len(u_dates) * 0.80)
+    fit_end_idx = max(10, cal_idx - cfg.horizon_days)
+    tr_fit = tr_df[tr_df["date"] <= u_dates[fit_end_idx]]
+    tr_cal = tr_df[tr_df["date"] >= u_dates[cal_idx]]
+    if len(tr_fit) < 200 or len(tr_cal) < 50:
+        tr_fit = tr_df
+        tr_cal = tr_df
+
+    model = _make_lgbm()
+    model.fit(tr_fit[FEATURE_COLS], tr_fit[target_col].astype(int))
+
+    raw_cal = model.predict_proba(tr_cal[FEATURE_COLS])
+    y_cal = tr_cal[target_col].astype(int).to_numpy()
+    calibrators: list[IsotonicRegression] = []
+    if raw_cal.shape[1] == 3:
+        for k in range(3):
+            ir = IsotonicRegression(out_of_bounds="clip")
+            ir.fit(raw_cal[:, k], (y_cal == k).astype(float))
+            calibrators.append(ir)
+
+    to_mask = y_cal == 1
+    e_to_r = float(tr_cal.loc[to_mask, ret_col].mean()) if to_mask.any() else 0.0
+    if not np.isfinite(e_to_r):
+        e_to_r = 0.0
+    return model, calibrators, e_to_r
+
+
+def _predict_calibrated_ev(
+    model: lgb.LGBMClassifier,
+    calibrators: list[IsotonicRegression] | None,
+    e_to_r: float,
+    X: pd.DataFrame,
+    cfg: ScreenerConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return calibrated (p_sl, p_to, p_tp, ev_r) in R-multiples."""
+    raw = model.predict_proba(X)
+    if raw.shape[1] == 2:
+        p_sl = raw[:, 0]
+        p_tp = raw[:, 1]
+        p_to = np.zeros_like(p_tp)
+    else:
+        if calibrators and len(calibrators) == 3:
+            p0 = np.clip(calibrators[0].predict(raw[:, 0]), 0.0, 1.0)
+            p1 = np.clip(calibrators[1].predict(raw[:, 1]), 0.0, 1.0)
+            p2 = np.clip(calibrators[2].predict(raw[:, 2]), 0.0, 1.0)
+            denom = np.maximum(p0 + p1 + p2, 1e-9)
+            p_sl, p_to, p_tp = p0 / denom, p1 / denom, p2 / denom
+        else:
+            p_sl, p_to, p_tp = raw[:, 0], raw[:, 1], raw[:, 2]
+
+    rr = cfg.target_atr_mult / cfg.stop_atr_mult
+    ev_r = p_tp * rr - p_sl * 1.0 + p_to * e_to_r
+    return p_sl, p_to, p_tp, ev_r
+
+
 @dataclass
 class TrainedArtifacts:
     model_long: lgb.LGBMClassifier
@@ -63,6 +144,10 @@ class TrainedArtifacts:
     data_mode: str
     backtest: dict[str, Any]
     feature_importance: list[dict[str, Any]]
+    cal_long: list[Any] | None = None
+    cal_short: list[Any] | None = None
+    e_to_r_long: float = 0.0
+    e_to_r_short: float = 0.0
 
 
 def build_panel_dataset(
@@ -114,7 +199,7 @@ def run_walk_forward_backtest(
     n_splits: int = 6,
     history: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
-    valid = panel.dropna(subset=["y_long", "y_short", "atr_14"]).copy()
+    valid = panel.dropna(subset=["y_long", "y_short", "c_long", "c_short", "atr_14"]).copy()
     valid = valid[valid["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m]
     valid = valid.sort_values("date")
 
@@ -152,13 +237,16 @@ def run_walk_forward_backtest(
         if len(tr) < 500 or te.empty:
             continue
 
-        m_long = _make_lgbm()
-        m_long.fit(tr[FEATURE_COLS], tr["y_long"].astype(int))
-        te["prob_long"] = m_long.predict_proba(te[FEATURE_COLS])[:, 1]
+        m_long, cal_l, e_to_l = _fit_calibrated_3class(tr, "c_long", "long_ret", cfg)
+        _, _, p_tp_l, ev_l = _predict_calibrated_ev(m_long, cal_l, e_to_l, te[FEATURE_COLS], cfg)
+        te["prob_long"] = p_tp_l
+        te["ev_long"] = ev_l
 
-        m_short = _make_lgbm()
-        m_short.fit(tr[FEATURE_COLS], tr["y_short"].astype(int))
-        te["prob_short"] = m_short.predict_proba(te[FEATURE_COLS])[:, 1]
+        tr_s = tr[tr["is_shortable"]] if len(tr[tr["is_shortable"]]) >= 200 else tr
+        m_short, cal_s, e_to_s = _fit_calibrated_3class(tr_s, "c_short", "short_ret", cfg)
+        _, _, p_tp_s, ev_s = _predict_calibrated_ev(m_short, cal_s, e_to_s, te[FEATURE_COLS], cfg)
+        te["prob_short"] = p_tp_s
+        te["ev_short"] = ev_s
 
         lr_p_l, lr_p_s = train_logreg_fold(tr, te)
         te["lr_prob_long"] = lr_p_l
@@ -262,17 +350,15 @@ def train_and_save_models(
 
     backtest = run_walk_forward_backtest(panel, benchmark_df, cfg, history=history)
 
-    valid = panel.dropna(subset=["y_long", "y_short", "atr_14"]).copy()
+    valid = panel.dropna(subset=["y_long", "y_short", "c_long", "c_short", "atr_14"]).copy()
     valid = valid[valid["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m]
 
-    model_long = _make_lgbm()
-    model_long.fit(valid[FEATURE_COLS], valid["y_long"].astype(int))
+    model_long, cal_long, e_to_r_long = _fit_calibrated_3class(valid, "c_long", "long_ret", cfg)
 
     valid_short = valid[valid["is_shortable"]]
     if len(valid_short) < 200:
         valid_short = valid
-    model_short = _make_lgbm()
-    model_short.fit(valid_short[FEATURE_COLS], valid_short["y_short"].astype(int))
+    model_short, cal_short, e_to_r_short = _fit_calibrated_3class(valid_short, "c_short", "short_ret", cfg)
 
     importances = model_long.feature_importances_
     total_imp = float(np.sum(importances)) or 1.0
@@ -297,6 +383,10 @@ def train_and_save_models(
         data_mode=data_mode,
         backtest=backtest,
         feature_importance=feat_imp,
+        cal_long=cal_long,
+        cal_short=cal_short,
+        e_to_r_long=e_to_r_long,
+        e_to_r_short=e_to_r_short,
     )
     save_artifacts(artifacts)
     return artifacts
@@ -307,12 +397,16 @@ def save_artifacts(artifacts: TrainedArtifacts, models_dir: Path = MODELS_DIR) -
         pickle.dump(artifacts.model_long, f)
     with open(models_dir / "model_short.pkl", "wb") as f:
         pickle.dump(artifacts.model_short, f)
+    with open(models_dir / "calibrators.pkl", "wb") as f:
+        pickle.dump({"cal_long": artifacts.cal_long, "cal_short": artifacts.cal_short}, f)
     meta = {
         "config": artifacts.config.model_dump(),
         "trained_at": artifacts.trained_at,
         "data_mode": artifacts.data_mode,
         "backtest": artifacts.backtest,
         "feature_importance": artifacts.feature_importance,
+        "e_to_r_long": artifacts.e_to_r_long,
+        "e_to_r_short": artifacts.e_to_r_short,
     }
     (models_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -327,6 +421,13 @@ def load_artifacts(models_dir: Path = MODELS_DIR) -> TrainedArtifacts | None:
         m_long = pickle.load(f)
     with open(sp, "rb") as f:
         m_short = pickle.load(f)
+    cp = models_dir / "calibrators.pkl"
+    cal_long, cal_short = None, None
+    if cp.exists():
+        with open(cp, "rb") as f:
+            cals = pickle.load(f)
+            cal_long = cals.get("cal_long")
+            cal_short = cals.get("cal_short")
     meta = json.loads(mp.read_text(encoding="utf-8"))
     return TrainedArtifacts(
         model_long=m_long,
@@ -336,6 +437,10 @@ def load_artifacts(models_dir: Path = MODELS_DIR) -> TrainedArtifacts | None:
         data_mode=meta.get("data_mode", "LIVE_EOD"),
         backtest=meta.get("backtest", {}),
         feature_importance=meta.get("feature_importance", []),
+        cal_long=cal_long,
+        cal_short=cal_short,
+        e_to_r_long=float(meta.get("e_to_r_long", 0.0)),
+        e_to_r_short=float(meta.get("e_to_r_short", 0.0)),
     )
 
 
@@ -415,15 +520,30 @@ def scan_latest(
     if liquid.empty:
         liquid = snap.copy()
 
-    liquid["prob_long"] = artifacts.model_long.predict_proba(liquid[FEATURE_COLS])[:, 1]
-    liquid["prob_short"] = artifacts.model_short.predict_proba(liquid[FEATURE_COLS])[:, 1]
+    p_sl_l, p_to_l, p_tp_l, ev_l = _predict_calibrated_ev(
+        artifacts.model_long, artifacts.cal_long, artifacts.e_to_r_long, liquid[FEATURE_COLS], cfg
+    )
+    p_sl_s, p_to_s, p_tp_s, ev_s = _predict_calibrated_ev(
+        artifacts.model_short, artifacts.cal_short, artifacts.e_to_r_short, liquid[FEATURE_COLS], cfg
+    )
+    liquid["prob_long"] = p_tp_l
+    liquid["p_sl_long"] = p_sl_l
+    liquid["p_to_long"] = p_to_l
+    liquid["ev_long"] = ev_l
+    liquid["prob_short"] = p_tp_s
+    liquid["p_sl_short"] = p_sl_s
+    liquid["p_to_short"] = p_to_s
+    liquid["ev_short"] = ev_s
 
     rr = cfg.target_atr_mult / cfg.stop_atr_mult
-    liquid["score_long"] = liquid["prob_long"] * rr * 100.0
-    liquid["score_short"] = liquid["prob_short"] * rr * 100.0
+    liquid["score_long"] = np.maximum(0.0, liquid["ev_long"]) * 100.0
+    liquid["score_short"] = np.maximum(0.0, liquid["ev_short"]) * 100.0
     liquid["target_gain_pct"] = (cfg.target_atr_mult * liquid["atr_14"] / liquid["close"]) * 100.0
 
     eligible = liquid[liquid["target_gain_pct"] >= cfg.min_target_gain_pct].copy()
+    if not eligible.empty:
+        eligible["pct_rank_long"] = eligible["ev_long"].rank(pct=True)
+        eligible["pct_rank_short"] = eligible["ev_short"].rank(pct=True)
 
     exp_long = shap.TreeExplainer(artifacts.model_long)
     exp_short = shap.TreeExplainer(artifacts.model_short)
@@ -435,12 +555,20 @@ def scan_latest(
             tp = entry + cfg.target_atr_mult * atr
             sl = entry - cfg.stop_atr_mult * atr
             prob = float(row["prob_long"])
+            p_sl = float(row["p_sl_long"])
+            p_to = float(row["p_to_long"])
+            ev_r = float(row["ev_long"])
+            pct_rank = float(row.get("pct_rank_long", 0.5))
             score = float(row["score_long"])
             drivers = _extract_top_shap(exp_long, row[FEATURE_COLS].to_frame().T)
         else:
             tp = entry - cfg.target_atr_mult * atr
             sl = entry + cfg.stop_atr_mult * atr
             prob = float(row["prob_short"])
+            p_sl = float(row["p_sl_short"])
+            p_to = float(row["p_to_short"])
+            ev_r = float(row["ev_short"])
+            pct_rank = float(row.get("pct_rank_short", 0.5))
             score = float(row["score_short"])
             drivers = _extract_top_shap(exp_short, row[FEATURE_COLS].to_frame().T)
 
@@ -453,9 +581,14 @@ def scan_latest(
             "index_membership": str(row["index_membership"]),
             "is_shortable": bool(row["is_shortable"]),
             "side": side,
-            "grade": _grade_from_score(score),
+            "grade": _grade_from_ev(ev_r),
+            "conviction_tier": _conviction_tier(ev_r, pct_rank),
+            "ev_r": round(ev_r, 3),
             "score": round(score, 1),
             "win_prob_pct": round(prob * 100, 1),
+            "p_tp_pct": round(prob * 100, 1),
+            "p_sl_pct": round(p_sl * 100, 1),
+            "p_to_pct": round(p_to * 100, 1),
             "expected_rr": round(rr, 2),
             "target_gain_pct": round(target_gain_pct, 2),
             "entry": round(entry, 2),
@@ -469,11 +602,11 @@ def scan_latest(
         }
 
     long_pool = eligible[eligible["prob_long"] >= cfg.min_win_prob] if not eligible.empty else pd.DataFrame()
-    top_l_df = long_pool.nlargest(cfg.top_k, "prob_long") if not long_pool.empty else pd.DataFrame()
+    top_l_df = long_pool.nlargest(cfg.top_k, "ev_long") if not long_pool.empty else pd.DataFrame()
     top_longs = [_build_card(r, "LONG", i + 1) for i, (_, r) in enumerate(top_l_df.iterrows())]
 
     short_pool = eligible[(eligible["is_shortable"]) & (eligible["prob_short"] >= cfg.min_win_prob)] if not eligible.empty else pd.DataFrame()
-    top_s_df = short_pool.nlargest(cfg.top_k, "prob_short") if not short_pool.empty else pd.DataFrame()
+    top_s_df = short_pool.nlargest(cfg.top_k, "ev_short") if not short_pool.empty else pd.DataFrame()
     top_shorts = [_build_card(r, "SHORT", i + 1) for i, (_, r) in enumerate(top_s_df.iterrows())]
 
     holdings_alerts: list[dict[str, Any]] = []
@@ -481,7 +614,10 @@ def scan_latest(
         held_set = {s.upper().strip() for s in held_symbols}
         held_df = snap[snap["symbol"].isin(held_set)].copy()
         if not held_df.empty:
-            held_df["prob_short"] = artifacts.model_short.predict_proba(held_df[FEATURE_COLS])[:, 1]
+            _, _, p_tp_hs, _ = _predict_calibrated_ev(
+                artifacts.model_short, artifacts.cal_short, artifacts.e_to_r_short, held_df[FEATURE_COLS], cfg
+            )
+            held_df["prob_short"] = p_tp_hs
             for _, r in held_df.sort_values("prob_short", ascending=False).iterrows():
                 prob_b = float(r["prob_short"])
                 risk_level = "HIGH" if prob_b >= 0.58 else ("ELEVATED" if prob_b >= 0.45 else "LOW")
@@ -548,12 +684,20 @@ def score_single_stock(
         return None
 
     row_df = last[FEATURE_COLS].to_frame().T.astype(float)
-    prob_long = float(artifacts.model_long.predict_proba(row_df)[0, 1])
-    prob_short = float(artifacts.model_short.predict_proba(row_df)[0, 1])
+    p_sl_l, p_to_l, p_tp_l, ev_l = _predict_calibrated_ev(
+        artifacts.model_long, artifacts.cal_long, artifacts.e_to_r_long, row_df, cfg
+    )
+    p_sl_s, p_to_s, p_tp_s, ev_s = _predict_calibrated_ev(
+        artifacts.model_short, artifacts.cal_short, artifacts.e_to_r_short, row_df, cfg
+    )
+    prob_long = float(p_tp_l[0])
+    prob_short = float(p_tp_s[0])
+    ev_long = float(ev_l[0])
+    ev_short = float(ev_s[0])
 
     m = meta_map.get(matched_sym)
     is_shortable = bool(m.is_shortable) if m else True
-    side = "SHORT" if (is_shortable and prob_short > prob_long) else "LONG"
+    side = "SHORT" if (is_shortable and ev_short > ev_long) else "LONG"
 
     entry = float(last["close"])
     rr = cfg.target_atr_mult / cfg.stop_atr_mult
@@ -561,14 +705,20 @@ def score_single_stock(
         tp = entry + cfg.target_atr_mult * atr
         sl = entry - cfg.stop_atr_mult * atr
         prob = prob_long
+        p_sl = float(p_sl_l[0])
+        p_to = float(p_to_l[0])
+        ev_r = ev_long
         exp = shap.TreeExplainer(artifacts.model_long)
     else:
         tp = entry - cfg.target_atr_mult * atr
         sl = entry + cfg.stop_atr_mult * atr
         prob = prob_short
+        p_sl = float(p_sl_s[0])
+        p_to = float(p_to_s[0])
+        ev_r = ev_short
         exp = shap.TreeExplainer(artifacts.model_short)
 
-    score = prob * rr * 100.0
+    score = max(0.0, ev_r) * 100.0
     target_gain_pct = ((tp - entry) / entry * 100.0) if side == "LONG" else ((entry - tp) / entry * 100.0)
     sigma_h = atr * float(np.sqrt(cfg.horizon_days))
 
@@ -579,9 +729,14 @@ def score_single_stock(
         "index_membership": m.index_membership if m else "SP500",
         "as_of": feats.index[-1].strftime("%Y-%m-%d"),
         "side": side,
-        "grade": _grade_from_score(score),
+        "grade": _grade_from_ev(ev_r),
+        "conviction_tier": _conviction_tier(ev_r, 0.90 if ev_r >= 0.20 else 0.50),
+        "ev_r": round(ev_r, 3),
         "score": round(score, 1),
         "win_prob_pct": round(prob * 100.0, 1),
+        "p_tp_pct": round(prob * 100.0, 1),
+        "p_sl_pct": round(p_sl * 100.0, 1),
+        "p_to_pct": round(p_to * 100.0, 1),
         "long_prob_pct": round(prob_long * 100.0, 1),
         "short_prob_pct": round(prob_short * 100.0, 1),
         "expected_rr": round(rr, 2),

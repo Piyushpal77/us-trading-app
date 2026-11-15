@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss
 from sklearn.preprocessing import StandardScaler
 
 from app.config import ScreenerConfig
@@ -17,6 +18,48 @@ def _spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
     rx = pd.Series(x).rank().to_numpy(dtype=float)
     ry = pd.Series(y).rank().to_numpy(dtype=float)
     return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _newey_west_ic(ics: list[float], max_lag: int = 15) -> dict[str, Any]:
+    """Compute mean, std, and Newey-West HAC t-stat (Bartlett kernel) for daily overlapping Rank IC."""
+    arr = np.array([v for v in ics if np.isfinite(v)], dtype=float)
+    n = len(arr)
+    if n < 10:
+        return {"mean": 0.0, "std": 0.0, "nw_t_stat": 0.0, "pos_pct": 0.0, "n_days": n}
+    m = float(np.mean(arr))
+    d = arr - m
+    gamma0 = float(np.dot(d, d) / n)
+    var_nw = gamma0
+    for lag in range(1, min(max_lag, n - 1) + 1):
+        w = 1.0 - lag / (max_lag + 1.0)
+        cov = float(np.dot(d[lag:], d[:-lag]) / n)
+        var_nw += 2.0 * w * cov
+    se = float(np.sqrt(max(1e-12, var_nw / n)))
+    return {
+        "mean": round(m, 4),
+        "std": round(float(np.std(arr, ddof=1)), 4),
+        "nw_t_stat": round(m / se, 2),
+        "pos_pct": round(float((arr > 0).mean() * 100.0), 1),
+        "n_days": n,
+    }
+
+
+def _paired_bootstrap_diff(a: list[float], b: list[float], n_boot: int = 1000, seed: int = 42) -> dict[str, Any]:
+    """Paired bootstrap of per-date difference (a - b) with 95% CI."""
+    n = min(len(a), len(b))
+    if n < 5:
+        return {"mean_diff": 0.0, "ci_95": [0.0, 0.0], "p_gt_zero": 0.0}
+    diff = np.array(a[:n], dtype=float) - np.array(b[:n], dtype=float)
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        means[i] = float(np.mean(rng.choice(diff, size=n, replace=True)))
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return {
+        "mean_diff": round(float(np.mean(diff)), 4),
+        "ci_95": [round(float(lo), 4), round(float(hi), 4)],
+        "p_gt_zero": round(float((means > 0).mean()), 3),
+    }
 
 
 def _bootstrap_ci(vals: list[float], n_boot: int = 500, seed: int = 42) -> list[float]:
@@ -151,6 +194,28 @@ def compute_screener_evaluation(
     mom_l_hits, mom_l_rs, mom_l_ics = [], [], []
     mom_s_hits, mom_s_rs, mom_s_ics = [], [], []
 
+    long_score_col = "ev_long" if "ev_long" in work.columns else "prob_long"
+    short_score_col = "ev_short" if "ev_short" in work.columns else "prob_short"
+
+    # Every-day Rank IC with Newey-West (lag=15) across all OOS days
+    daily_l_ics: list[float] = []
+    daily_s_ics: list[float] = []
+    for dt in unique_dates:
+        day_all = work[work["date"] == dt]
+        if len(day_all) >= 20:
+            ic_dl = _spearman_corr(day_all[long_score_col].to_numpy(dtype=float), day_all["long_r"].to_numpy(dtype=float))
+            if np.isfinite(ic_dl):
+                daily_l_ics.append(ic_dl)
+            s_all = day_all[day_all["is_shortable"]]
+            if len(s_all) >= 15:
+                ic_ds = _spearman_corr(s_all[short_score_col].to_numpy(dtype=float), s_all["short_r"].to_numpy(dtype=float))
+                if np.isfinite(ic_ds):
+                    daily_s_ics.append(ic_ds)
+
+    lgbm_l_date_r: list[float] = []
+    lr_l_date_r: list[float] = []
+    mom_l_date_r: list[float] = []
+
     fold_records: dict[int, dict[str, list[float]]] = {}
 
     for dt in rebal_dates:
@@ -169,17 +234,18 @@ def compute_screener_evaluation(
         base_l_hits.extend(day["y_long"].tolist())
         base_l_rs.extend(day["long_r"].tolist())
 
-        # LightGBM Long Top-K
-        top_l = day[day["prob_long"] >= cfg.min_win_prob].nlargest(cfg.top_k, "prob_long")
+        # LightGBM Long Top-K (ranked by EV when available)
+        top_l = day[day["prob_long"] >= cfg.min_win_prob].nlargest(cfg.top_k, long_score_col)
         if not top_l.empty:
             lgbm_l_hits.extend(top_l["y_long"].tolist())
             lgbm_l_rs.extend(top_l["long_r"].tolist())
+            lgbm_l_date_r.append(float(top_l["long_r"].mean()))
             lift_l = (float(top_l["y_long"].mean()) - b_l_hit) * 100.0
             long_lifts.append(lift_l)
             f_rec["l_top"].extend(top_l["y_long"].tolist())
             f_rec["l_base"].extend(day["y_long"].tolist())
 
-        ic_l = _spearman_corr(day["prob_long"].to_numpy(dtype=float), day["long_r"].to_numpy(dtype=float))
+        ic_l = _spearman_corr(day[long_score_col].to_numpy(dtype=float), day["long_r"].to_numpy(dtype=float))
         if np.isfinite(ic_l):
             long_ics.append(ic_l)
             f_rec["l_ic"].append(ic_l)
@@ -190,7 +256,7 @@ def compute_screener_evaluation(
             b_s_hit = float(s_pool["y_short"].mean())
             base_s_hits.extend(s_pool["y_short"].tolist())
             base_s_rs.extend(s_pool["short_r"].tolist())
-            top_s = s_pool[s_pool["prob_short"] >= cfg.min_win_prob].nlargest(cfg.top_k, "prob_short")
+            top_s = s_pool[s_pool["prob_short"] >= cfg.min_win_prob].nlargest(cfg.top_k, short_score_col)
             if not top_s.empty:
                 lgbm_s_hits.extend(top_s["y_short"].tolist())
                 lgbm_s_rs.extend(top_s["short_r"].tolist())
@@ -199,7 +265,7 @@ def compute_screener_evaluation(
                 f_rec["s_top"].extend(top_s["y_short"].tolist())
                 f_rec["s_base"].extend(s_pool["y_short"].tolist())
 
-            ic_s = _spearman_corr(s_pool["prob_short"].to_numpy(dtype=float), s_pool["short_r"].to_numpy(dtype=float))
+            ic_s = _spearman_corr(s_pool[short_score_col].to_numpy(dtype=float), s_pool["short_r"].to_numpy(dtype=float))
             if np.isfinite(ic_s):
                 short_ics.append(ic_s)
                 f_rec["s_ic"].append(ic_s)
@@ -209,6 +275,7 @@ def compute_screener_evaluation(
             lr_tl = day.nlargest(cfg.top_k, "lr_prob_long")
             lr_l_hits.extend(lr_tl["y_long"].tolist())
             lr_l_rs.extend(lr_tl["long_r"].tolist())
+            lr_l_date_r.append(float(lr_tl["long_r"].mean()))
             ic_lr_l = _spearman_corr(day["lr_prob_long"].to_numpy(dtype=float), day["long_r"].to_numpy(dtype=float))
             if np.isfinite(ic_lr_l):
                 lr_l_ics.append(ic_lr_l)
@@ -227,6 +294,7 @@ def compute_screener_evaluation(
             m_tl = m_day.nlargest(cfg.top_k, "mom_12_1")
             mom_l_hits.extend(m_tl["y_long"].tolist())
             mom_l_rs.extend(m_tl["long_r"].tolist())
+            mom_l_date_r.append(float(m_tl["long_r"].mean()))
             ic_ml = _spearman_corr(m_day["mom_12_1"].to_numpy(dtype=float), m_day["long_r"].to_numpy(dtype=float))
             if np.isfinite(ic_ml):
                 mom_l_ics.append(ic_ml)
@@ -314,6 +382,9 @@ def compute_screener_evaluation(
     except Exception:
         pass
 
+    brier_long = round(float(brier_score_loss(work["y_long"].astype(int), work["prob_long"].clip(0.0, 1.0))), 4)
+    brier_short = round(float(brier_score_loss(work["y_short"].astype(int), work["prob_short"].clip(0.0, 1.0))), 4)
+
     return {
         "rebalance_dates": int(len(rebal_dates)),
         "long_summary": {
@@ -324,7 +395,9 @@ def compute_screener_evaluation(
             "lift_ci_95": _bootstrap_ci(long_lifts, n_boot=n_bootstrap),
             "avg_r": round(float(np.mean(lgbm_l_rs)), 3) if lgbm_l_rs else 0.0,
             "base_avg_r": round(float(np.mean(base_l_rs)), 3) if base_l_rs else 0.0,
+            "brier_score": brier_long,
             "rank_ic": _ic_stats(long_ics),
+            "daily_ic_nw": _newey_west_ic(daily_l_ics, max_lag=max(5, cfg.horizon_days)),
             "folds_beating_base": f"{l_beats}/{len(per_fold)}",
         },
         "short_summary": {
@@ -335,8 +408,14 @@ def compute_screener_evaluation(
             "lift_ci_95": _bootstrap_ci(short_lifts, n_boot=n_bootstrap),
             "avg_r": round(float(np.mean(lgbm_s_rs)), 3) if lgbm_s_rs else 0.0,
             "base_avg_r": round(float(np.mean(base_s_rs)), 3) if base_s_rs else 0.0,
+            "brier_score": brier_short,
             "rank_ic": _ic_stats(short_ics),
+            "daily_ic_nw": _newey_west_ic(daily_s_ics, max_lag=max(5, cfg.horizon_days)),
             "folds_beating_base": f"{s_beats}/{len(per_fold)}",
+        },
+        "paired_vs_baselines": {
+            "lgbm_minus_logreg_long_r": _paired_bootstrap_diff(lgbm_l_date_r, lr_l_date_r),
+            "lgbm_minus_mom_long_r": _paired_bootstrap_diff(lgbm_l_date_r, mom_l_date_r),
         },
         "baselines": {
             "lgbm": {

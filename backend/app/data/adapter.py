@@ -229,7 +229,12 @@ class YFinanceUSAdapter(MarketDataAdapter):
             else:
                 full_symbols.append(sym)
 
-        synced_inc = self._download_and_store_batches(inc_symbols, oldest_inc_start.isoformat(), end.isoformat(), batch_size)
+        re_refresh: list[str] = []
+        synced_inc = self._download_and_store_batches(
+            inc_symbols, oldest_inc_start.isoformat(), end.isoformat(), batch_size, re_refresh=re_refresh
+        )
+        if re_refresh:
+            full_symbols = list(dict.fromkeys(full_symbols + re_refresh))
         synced_full = self._download_and_store_batches(full_symbols, full_start.isoformat(), end.isoformat(), batch_size)
         self._sync_benchmark(full_start.isoformat(), end.isoformat())
         return {
@@ -239,7 +244,12 @@ class YFinanceUSAdapter(MarketDataAdapter):
         }
 
     def _download_and_store_batches(
-        self, symbols: list[str], start_iso: str, end_iso: str, batch_size: int
+        self,
+        symbols: list[str],
+        start_iso: str,
+        end_iso: str,
+        batch_size: int,
+        re_refresh: list[str] | None = None,
     ) -> int:
         if not symbols:
             return 0
@@ -265,6 +275,26 @@ class YFinanceUSAdapter(MarketDataAdapter):
                         sub = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
                         clean = self._normalize_ohlcv(sub)
                         if not clean.empty:
+                            if re_refresh is not None:
+                                min_d = clean.index.min().strftime("%Y-%m-%d")
+                                max_d = clean.index.max().strftime("%Y-%m-%d")
+                                existing = dict(
+                                    conn.execute(
+                                        "SELECT date, close FROM ohlcv WHERE symbol = ? AND date >= ? AND date <= ?",
+                                        (sym, min_d, max_d),
+                                    ).fetchall()
+                                )
+                                mismatch = any(
+                                    existing.get(idx.strftime("%Y-%m-%d"), 0) > 0
+                                    and abs(float(r["close"]) - float(existing[idx.strftime("%Y-%m-%d")]))
+                                    / float(existing[idx.strftime("%Y-%m-%d")])
+                                    > 0.005
+                                    for idx, r in clean.iterrows()
+                                    if idx.strftime("%Y-%m-%d") in existing
+                                )
+                                if mismatch:
+                                    re_refresh.append(sym)
+                                    continue
                             self._upsert_ohlcv(conn, sym, clean)
                             synced += 1
                     except Exception:

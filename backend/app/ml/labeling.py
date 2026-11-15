@@ -21,6 +21,8 @@ def compute_triple_barrier_labels(
 
     y_long = np.full(n, np.nan)
     y_short = np.full(n, np.nan)
+    c_long = np.full(n, np.nan)   # 0=SL, 1=Timeout, 2=TP
+    c_short = np.full(n, np.nan)  # 0=SL, 1=Timeout, 2=TP
     long_ret = np.full(n, np.nan)
     short_ret = np.full(n, np.nan)
 
@@ -33,11 +35,13 @@ def compute_triple_barrier_labels(
         l_tp = entry + target_atr_mult * a
         l_sl = entry - stop_atr_mult * a
         l_outcome = 0.0
+        l_cls = 1.0  # Timeout
         l_r = (closes[i + horizon_days] - entry) / entry
 
         s_tp = entry - target_atr_mult * a
         s_sl = entry + stop_atr_mult * a
         s_outcome = 0.0
+        s_cls = 1.0  # Timeout
         s_r = (entry - closes[i + horizon_days]) / entry
 
         l_done = False
@@ -52,11 +56,13 @@ def compute_triple_barrier_labels(
                 if hit_sl:
                     fill_px = min(op, l_sl)
                     l_outcome = 0.0
+                    l_cls = 0.0
                     l_r = (fill_px - entry) / entry
                     l_done = True
                 elif hit_tp:
                     fill_px = max(op, l_tp)
                     l_outcome = 1.0
+                    l_cls = 2.0
                     l_r = (fill_px - entry) / entry
                     l_done = True
 
@@ -66,11 +72,13 @@ def compute_triple_barrier_labels(
                 if hit_sl:
                     fill_px = max(op, s_sl)
                     s_outcome = 0.0
+                    s_cls = 0.0
                     s_r = (entry - fill_px) / entry
                     s_done = True
                 elif hit_tp:
                     fill_px = min(op, s_tp)
                     s_outcome = 1.0
+                    s_cls = 2.0
                     s_r = (entry - fill_px) / entry
                     s_done = True
 
@@ -79,6 +87,8 @@ def compute_triple_barrier_labels(
 
         y_long[i] = l_outcome
         y_short[i] = s_outcome
+        c_long[i] = l_cls
+        c_short[i] = s_cls
         long_ret[i] = l_r
         short_ret[i] = s_r
 
@@ -86,6 +96,8 @@ def compute_triple_barrier_labels(
         {
             "y_long": y_long,
             "y_short": y_short,
+            "c_long": c_long,
+            "c_short": c_short,
             "long_ret": long_ret,
             "short_ret": short_ret,
         },

@@ -85,6 +85,19 @@ function SignalCard({ item, timing, onSelect }) {
             >
               GRADE {item.grade}
             </span>
+            {item.conviction_tier && (
+              <span
+                className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                  item.conviction_tier === "HIGH"
+                    ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                    : item.conviction_tier === "MEDIUM"
+                      ? "bg-sky-500/20 text-sky-300 border-sky-500/40"
+                      : "bg-slate-800 text-slate-400 border-slate-700"
+                }`}
+              >
+                {item.conviction_tier}
+              </span>
+            )}
             {item.index_membership && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
                 {item.index_membership}
@@ -118,10 +131,10 @@ function SignalCard({ item, timing, onSelect }) {
             }`}
           >
             {isLong ? <ArrowUpRight className="w-4 h-4" /> : <ArrowDownRight className="w-4 h-4" />}
-            {item.win_prob_pct}% Win
+            {item.ev_r !== undefined ? `EV ${item.ev_r >= 0 ? "+" : ""}${item.ev_r}R` : `${item.win_prob_pct}% Win`}
           </div>
           <div className="text-[11px] text-slate-400">
-            Score {item.score} · {item.expected_rr}R
+            {item.win_prob_pct}% TP · {item.expected_rr}R
           </div>
         </div>
       </div>
@@ -790,8 +803,14 @@ export default function App() {
                 <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-2">
                   <TrendingUp className="w-4 h-4" /> Top {config?.top_k ?? 5} Bullish Setups (S&amp;P 500 / NDX 100)
                 </h2>
-                <span className="text-xs text-slate-400">Sorted by Win Prob ↓</span>
+                <span className="text-xs text-slate-400">Sorted by Calibrated EV ↓</span>
               </div>
+              {(scan?.top_longs || []).length > 0 &&
+                !(scan?.top_longs || []).some((x) => x.conviction_tier === "HIGH") && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                    No High-Conviction Picks Today — showing best available setups ranked by calibrated EV.
+                  </div>
+                )}
               <div className="space-y-3">
                 {(scan?.top_longs || []).map((item) => (
                   <SignalCard
@@ -807,9 +826,16 @@ export default function App() {
             <section className="space-y-3">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-bold uppercase tracking-wider text-rose-400 flex items-center gap-2">
-                  <TrendingDown className="w-4 h-4" /> Top {config?.top_k ?? 5} Bearish Setups (Shortable)
+                  <TrendingDown className="w-4 h-4" />{" "}
+                  {(backtest?.screener_eval?.short_summary?.avg_r ?? 0) <= 0
+                    ? `Bearish Watchlist (Top ${config?.top_k ?? 5})`
+                    : `Top ${config?.top_k ?? 5} Bearish Setups (Shortable)`}
                 </h2>
-                <span className="text-xs text-slate-400">S&amp;P 500 &amp; Nasdaq 100</span>
+                <span className="text-xs text-slate-400">
+                  {(backtest?.screener_eval?.short_summary?.avg_r ?? 0) <= 0
+                    ? "Low/Negative OOS Edge · Context Only"
+                    : "S&P 500 & Nasdaq 100"}
+                </span>
               </div>
               <div className="space-y-3">
                 {(scan?.top_shorts || []).map((item) => (
@@ -1125,6 +1151,8 @@ export default function App() {
                     </div>
                     <div className="text-[11px] text-slate-400">
                       Avg R: {backtest.screener_eval.long_summary.avg_r} vs {backtest.screener_eval.long_summary.base_avg_r} base
+                      {backtest.screener_eval.long_summary.brier_score !== undefined &&
+                        ` · Brier ${backtest.screener_eval.long_summary.brier_score}`}
                     </div>
                   </div>
                   <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
@@ -1134,9 +1162,50 @@ export default function App() {
                     </div>
                     <div className="text-[11px] text-slate-400">
                       Avg R: {backtest.screener_eval.short_summary.avg_r} vs {backtest.screener_eval.short_summary.base_avg_r} base
+                      {backtest.screener_eval.short_summary.brier_score !== undefined &&
+                        ` · Brier ${backtest.screener_eval.short_summary.brier_score}`}
                     </div>
                   </div>
                 </div>
+
+                {(backtest.screener_eval.long_summary?.daily_ic_nw || backtest.screener_eval.paired_vs_baselines) && (
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
+                    {backtest.screener_eval.long_summary?.daily_ic_nw && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                        <div className="text-[11px] text-slate-400">Every-Day Long Rank IC (Newey-West lag=15)</div>
+                        <div className="font-mono font-bold text-white mt-1">
+                          {backtest.screener_eval.long_summary.daily_ic_nw.mean} (NW t={backtest.screener_eval.long_summary.daily_ic_nw.nw_t_stat})
+                        </div>
+                      </div>
+                    )}
+                    {backtest.screener_eval.paired_vs_baselines?.lgbm_minus_logreg_long_r && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                        <div className="text-[11px] text-slate-400">LightGBM EV − LogReg (Long Avg R)</div>
+                        <div className="font-mono font-bold text-white mt-1">
+                          {backtest.screener_eval.paired_vs_baselines.lgbm_minus_logreg_long_r.mean_diff >= 0 ? "+" : ""}
+                          {backtest.screener_eval.paired_vs_baselines.lgbm_minus_logreg_long_r.mean_diff}R{" "}
+                          <span className="text-slate-400 font-normal">
+                            [95% CI {backtest.screener_eval.paired_vs_baselines.lgbm_minus_logreg_long_r.ci_95[0]},{" "}
+                            {backtest.screener_eval.paired_vs_baselines.lgbm_minus_logreg_long_r.ci_95[1]}]
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {backtest.screener_eval.paired_vs_baselines?.lgbm_minus_mom_long_r && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                        <div className="text-[11px] text-slate-400">LightGBM EV − 12-1 Mom (Long Avg R)</div>
+                        <div className="font-mono font-bold text-white mt-1">
+                          {backtest.screener_eval.paired_vs_baselines.lgbm_minus_mom_long_r.mean_diff >= 0 ? "+" : ""}
+                          {backtest.screener_eval.paired_vs_baselines.lgbm_minus_mom_long_r.mean_diff}R{" "}
+                          <span className="text-slate-400 font-normal">
+                            [95% CI {backtest.screener_eval.paired_vs_baselines.lgbm_minus_mom_long_r.ci_95[0]},{" "}
+                            {backtest.screener_eval.paired_vs_baselines.lgbm_minus_mom_long_r.ci_95[1]}]
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                   <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
