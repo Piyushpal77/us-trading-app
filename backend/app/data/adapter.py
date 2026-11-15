@@ -343,11 +343,15 @@ class YFinanceUSAdapter(MarketDataAdapter):
     def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
-        renamed = df.rename(columns={c: str(c).lower() for c in df.columns})
-        cols = [c for c in ("open", "high", "low", "close", "volume") if c in renamed.columns]
+        work = df.copy()
+        if isinstance(work.columns, pd.MultiIndex):
+            work.columns = [str(c[0]).lower() for c in work.columns]
+        else:
+            work.columns = [str(c).lower() for c in work.columns]
+        cols = [c for c in ("open", "high", "low", "close", "volume") if c in work.columns]
         if len(cols) < 5:
             return pd.DataFrame()
-        clean = renamed[cols].dropna().copy()
+        clean = work[cols].dropna().copy()
         clean.index = pd.to_datetime(clean.index).tz_localize(None).normalize()
         clean.index.name = "date"
         clean = clean[~clean.index.duplicated(keep="last")].sort_index()

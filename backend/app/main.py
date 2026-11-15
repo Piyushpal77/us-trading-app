@@ -450,6 +450,7 @@ def get_backtest() -> dict[str, Any]:
     return {
         "equity_curve": state.artifacts.backtest.get("equity_curve", []),
         "metrics": state.artifacts.backtest.get("metrics", {}),
+        "screener_eval": state.artifacts.backtest.get("screener_eval", {}),
         "feature_importance": state.artifacts.feature_importance,
         "trained_at": state.artifacts.trained_at,
         "data_mode": state.artifacts.data_mode,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -172,6 +174,11 @@ def compute_features(df: pd.DataFrame, benchmark_df: pd.DataFrame | None = None)
         rs_line = close / b_close.replace(0.0, np.nan)
         out["rs_slope_10"] = rs_line.pct_change(10)
     else:
+        warnings.warn(
+            "benchmark_df is empty — relative strength features (rs_5d, rs_20d, rs_60d, rs_slope_10) are falling back to raw returns.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         out["rs_5d"] = out["ret_5d"]
         out["rs_20d"] = out["ret_20d"]
         out["rs_60d"] = out["ret_60d"]

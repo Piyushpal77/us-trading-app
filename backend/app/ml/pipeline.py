@@ -16,6 +16,7 @@ import shap
 from app.config import MODELS_DIR, ScreenerConfig
 from app.data.universe import UniverseMember
 from app.features.indicators import FEATURE_COLS, FEATURE_LABELS, compute_features
+from app.ml.evaluation import compute_screener_evaluation, train_logreg_fold
 from app.ml.labeling import compute_triple_barrier_labels
 
 
@@ -106,7 +107,7 @@ def run_walk_forward_backtest(
     panel: pd.DataFrame,
     benchmark_df: pd.DataFrame,
     cfg: ScreenerConfig,
-    n_splits: int = 3,
+    n_splits: int = 6,
 ) -> dict[str, Any]:
     valid = panel.dropna(subset=["y_long", "y_short", "atr_14"]).copy()
     valid = valid[valid["avg_dollar_vol_m"] >= cfg.min_avg_dollar_vol_m]
@@ -151,6 +152,11 @@ def run_walk_forward_backtest(
         m_short = _make_lgbm()
         m_short.fit(tr[FEATURE_COLS], tr["y_short"].astype(int))
         te["prob_short"] = m_short.predict_proba(te[FEATURE_COLS])[:, 1]
+
+        lr_p_l, lr_p_s = train_logreg_fold(tr, te)
+        te["lr_prob_long"] = lr_p_l
+        te["lr_prob_short"] = lr_p_s
+        te["fold_id"] = s
 
         oos_preds.append(te)
 
@@ -219,8 +225,11 @@ def run_walk_forward_backtest(
     losses = [-r for r in all_rets if r <= 0]
     pf = (sum(wins) / sum(losses)) if losses and sum(losses) > 0 else 2.0
 
+    screener_eval = compute_screener_evaluation(oos, None, cfg, panel=valid)
+
     return {
         "equity_curve": curve,
+        "screener_eval": screener_eval,
         "metrics": {
             "precision_at_5_long": round(float(np.mean(long_hits) * 100), 1) if long_hits else 0.0,
             "precision_at_5_short": round(float(np.mean(short_hits) * 100), 1) if short_hits else 0.0,

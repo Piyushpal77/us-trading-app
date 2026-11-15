@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -26,11 +31,23 @@ def fetch_hourly_bars(symbol: str, period: str = "60d") -> pd.DataFrame:
     else:
         df.columns = [str(c).lower() for c in df.columns]
     keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
-    return df[keep].dropna()
+    df = df[keep].dropna()
+    if df.empty:
+        return df
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(US_EASTERN)
+    else:
+        df.index = df.index.tz_convert(US_EASTERN)
+    # Drop partial in-progress 1h bar so RSI/EMA are computed on completed bars only
+    now_et = datetime.now(US_EASTERN)
+    last_ts = df.index[-1]
+    if last_ts.date() == now_et.date() and last_ts.hour == now_et.hour and len(df) > 1:
+        df = df.iloc[:-1]
+    return df
 
 
 def compute_hourly_indicators(df_1h: pd.DataFrame) -> pd.DataFrame:
-    """Compute 1h EMA(20), RSI(14), ATR(14), and 4h-resampled RSI/EMA context."""
+    """Compute 1h EMA(20), RSI(14), ATR(14), and 09:30-ET-aligned 4h-resampled RSI/EMA context."""
     df = df_1h.copy()
     c = df["close"].astype(float)
     h = df["high"].astype(float)
@@ -40,11 +57,12 @@ def compute_hourly_indicators(df_1h: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([(h - l), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
     df["atr_14_1h"] = tr.rolling(14).mean()
     df["dist_ema20_1h_pct"] = (c / df["ema_20_1h"] - 1.0) * 100.0
+    df["dist_ema20_1h_atr"] = (c - df["ema_20_1h"]) / df["atr_14_1h"].replace(0.0, np.nan)
 
-    # Resample 1h -> 4h for broader intraday trend confirmation
+    # Align 4h resample to 09:30 ET session open so bars don't straddle sessions
     df_4h = (
         df[["open", "high", "low", "close", "volume"]]
-        .resample("4h")
+        .resample("4h", origin="1970-01-01 09:30:00")
         .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
         .dropna()
     )
@@ -80,29 +98,30 @@ def analyze_hourly_entry(symbol: str, side: str = "LONG") -> dict[str, Any]:
     rsi_4h = float(last["rsi_14_4h"]) if np.isfinite(last["rsi_14_4h"]) else 50.0
     dist_pct = float(last["dist_ema20_1h_pct"]) if np.isfinite(last["dist_ema20_1h_pct"]) else 0.0
     atr_1h = float(last["atr_14_1h"]) if np.isfinite(last["atr_14_1h"]) else px * 0.005
+    dist_atr = float(last["dist_ema20_1h_atr"]) if np.isfinite(last["dist_ema20_1h_atr"]) else 0.0
 
     side_u = side.upper().strip()
     if side_u == "LONG":
-        if rsi_1h <= 62.0 and dist_pct <= 1.0 and px >= ema_4h * 0.99:
+        if rsi_1h <= 58.0 and dist_atr <= 0.75 and px >= ema_4h * 0.99:
             signal = "ENTER_NOW"
-            reason = f"1h RSI ({rsi_1h:.1f}) not overbought & price near 1h EMA20 ({dist_pct:+.2f}%)."
-        elif rsi_1h > 68.0 or dist_pct > 1.8:
+            reason = f"1h RSI ({rsi_1h:.1f}) & price within {dist_atr:+.2f} ATR ({dist_pct:+.2f}%) of 1h EMA20."
+        elif rsi_1h > 65.0 or dist_atr > 1.5:
             signal = "WAIT_PULLBACK"
-            reason = f"Extended intraday (1h RSI {rsi_1h:.1f}, {dist_pct:+.2f}% above 1h EMA20); wait for dip."
+            reason = f"Extended intraday (1h RSI {rsi_1h:.1f}, {dist_atr:+.2f} ATR above 1h EMA20); wait for dip."
         else:
             signal = "NEUTRAL_LIMIT"
-            reason = f"Moderate intraday setup (1h RSI {rsi_1h:.1f}); consider limit near 1h EMA20."
+            reason = f"Moderate intraday setup (1h RSI {rsi_1h:.1f}, {dist_atr:+.2f} ATR); consider limit near 1h EMA20."
         suggested_entry = round(min(px, ema_1h + 0.25 * atr_1h), 2)
     else:
-        if rsi_1h >= 38.0 and dist_pct >= -1.0 and px <= ema_4h * 1.01:
+        if rsi_1h >= 42.0 and dist_atr >= -0.75 and px <= ema_4h * 1.01:
             signal = "ENTER_NOW"
-            reason = f"1h RSI ({rsi_1h:.1f}) not oversold & price near 1h EMA20 ({dist_pct:+.2f}%)."
-        elif rsi_1h < 32.0 or dist_pct < -1.8:
+            reason = f"1h RSI ({rsi_1h:.1f}) & price within {dist_atr:+.2f} ATR ({dist_pct:+.2f}%) of 1h EMA20."
+        elif rsi_1h < 35.0 or dist_atr < -1.5:
             signal = "WAIT_BOUNCE"
-            reason = f"Oversold intraday (1h RSI {rsi_1h:.1f}, {dist_pct:+.2f}% below 1h EMA20); wait for bounce."
+            reason = f"Oversold intraday (1h RSI {rsi_1h:.1f}, {dist_atr:+.2f} ATR below 1h EMA20); wait for bounce."
         else:
             signal = "NEUTRAL_LIMIT"
-            reason = f"Moderate short setup (1h RSI {rsi_1h:.1f}); consider limit near 1h EMA20."
+            reason = f"Moderate short setup (1h RSI {rsi_1h:.1f}, {dist_atr:+.2f} ATR); consider limit near 1h EMA20."
         suggested_entry = round(max(px, ema_1h - 0.25 * atr_1h), 2)
 
     return {

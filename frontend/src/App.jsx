@@ -1096,6 +1096,93 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {backtest?.screener_eval?.long_summary && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <div className="rounded-xl border border-emerald-500/30 bg-slate-900/70 p-3.5">
+                    <div className="text-[11px] text-slate-400">Long Top-K vs Base Rate</div>
+                    <div className="text-lg font-bold text-emerald-400 mt-1 font-mono">
+                      {backtest.screener_eval.long_summary.top_k_hit_pct}% vs {backtest.screener_eval.long_summary.base_rate_pct}%
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Lift +{backtest.screener_eval.long_summary.lift_pp} pp ({backtest.screener_eval.long_summary.lift_ratio}x) · Folds {backtest.screener_eval.long_summary.folds_beating_base}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-rose-500/30 bg-slate-900/70 p-3.5">
+                    <div className="text-[11px] text-slate-400">Short Top-K vs Base Rate</div>
+                    <div className="text-lg font-bold text-rose-400 mt-1 font-mono">
+                      {backtest.screener_eval.short_summary.top_k_hit_pct}% vs {backtest.screener_eval.short_summary.base_rate_pct}%
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Lift +{backtest.screener_eval.short_summary.lift_pp} pp ({backtest.screener_eval.short_summary.lift_ratio}x) · Folds {backtest.screener_eval.short_summary.folds_beating_base}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
+                    <div className="text-[11px] text-slate-400">Long Rank IC (Spearman)</div>
+                    <div className="text-lg font-bold text-white mt-1 font-mono">
+                      {backtest.screener_eval.long_summary.rank_ic.mean} (t={backtest.screener_eval.long_summary.rank_ic.t_stat})
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Avg R: {backtest.screener_eval.long_summary.avg_r} vs {backtest.screener_eval.long_summary.base_avg_r} base
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
+                    <div className="text-[11px] text-slate-400">Short Rank IC (Spearman)</div>
+                    <div className="text-lg font-bold text-white mt-1 font-mono">
+                      {backtest.screener_eval.short_summary.rank_ic.mean} (t={backtest.screener_eval.short_summary.rank_ic.t_stat})
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Avg R: {backtest.screener_eval.short_summary.avg_r} vs {backtest.screener_eval.short_summary.base_avg_r} base
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+                    <h3 className="text-sm font-bold text-white mb-3">Model vs Baselines (Top-K Hit Rate &amp; Avg R)</h3>
+                    <table className="w-full text-xs">
+                      <thead className="text-slate-400 border-b border-slate-800">
+                        <tr>
+                          <th className="text-left py-1.5">Model</th>
+                          <th className="text-right py-1.5">Long Hit</th>
+                          <th className="text-right py-1.5">Long R</th>
+                          <th className="text-right py-1.5">Short Hit</th>
+                          <th className="text-right py-1.5">Short R</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60 font-mono">
+                        {Object.entries(backtest.screener_eval.baselines || {}).map(([k, v]) => (
+                          <tr key={k}>
+                            <td className="py-1.5 font-sans text-slate-200 capitalize">{k.replace(/_/g, " ")}</td>
+                            <td className="py-1.5 text-right text-emerald-400">{v.long_hit_pct}%</td>
+                            <td className="py-1.5 text-right text-slate-300">{v.long_avg_r}</td>
+                            <td className="py-1.5 text-right text-rose-400">{v.short_hit_pct}%</td>
+                            <td className="py-1.5 text-right text-slate-300">{v.short_avg_r}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+                    <h3 className="text-sm font-bold text-white mb-3">Long Probability Decile Lift (D1 → D10)</h3>
+                    <div className="grid grid-cols-10 gap-1.5 items-end h-28 pt-2">
+                      {(backtest.screener_eval.deciles_long || []).map((d) => (
+                        <div key={d.decile} className="flex flex-col items-center gap-1">
+                          <span className="text-[10px] font-mono text-slate-300">{d.tb_hit_rate_pct}%</span>
+                          <div
+                            className="w-full rounded-t bg-emerald-500/70"
+                            style={{ height: `${Math.max(12, d.tb_hit_rate_pct * 1.6)}px` }}
+                          />
+                          <span className="text-[10px] font-mono text-slate-500">D{d.decile}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </main>
