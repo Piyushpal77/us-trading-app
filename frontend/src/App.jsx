@@ -132,10 +132,11 @@ function SignalCard({ item, timing, onSelect }) {
             }`}
           >
             {isLong ? <ArrowUpRight className="w-4 h-4" /> : <ArrowDownRight className="w-4 h-4" />}
-            {item.ev_r !== undefined ? `EV ${item.ev_r >= 0 ? "+" : ""}${item.ev_r}R` : `${item.win_prob_pct}% Win`}
+            {item.win_prob_pct}% Win
           </div>
           <div className="text-[11px] text-slate-400">
-            {item.win_prob_pct}% TP · {item.expected_rr}R
+            {item.ev_r !== undefined ? `EV ${item.ev_r >= 0 ? "+" : ""}${item.ev_r}R · ` : ""}
+            {item.expected_rr}R
           </div>
         </div>
       </div>
@@ -804,7 +805,7 @@ export default function App() {
                 <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-2">
                   <TrendingUp className="w-4 h-4" /> Top {config?.top_k ?? 5} Bullish Setups (S&amp;P 500 / NDX 100)
                 </h2>
-                <span className="text-xs text-slate-400">Sorted by Calibrated EV ↓</span>
+                <span className="text-xs text-slate-400">Sorted by % Win ↓</span>
               </div>
               {(scan?.top_longs || []).length > 0 &&
                 !(scan?.top_longs || []).some((x) => x.conviction_tier === "HIGH") && (

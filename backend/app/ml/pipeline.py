@@ -24,22 +24,22 @@ from app.ml.labeling import compute_triple_barrier_labels
 US_EASTERN = ZoneInfo("America/New_York")
 
 
-def _grade_from_ev(ev_r: float) -> str:
-    if ev_r >= 0.30:
+def _grade_from_win_prob(prob: float, pct_rank: float = 0.5) -> str:
+    if prob >= 0.42 or pct_rank >= 0.96:
         return "A+"
-    if ev_r >= 0.20:
+    if prob >= 0.38 or pct_rank >= 0.90:
         return "A"
-    if ev_r >= 0.12:
+    if prob >= 0.34 or pct_rank >= 0.80:
         return "B+"
-    if ev_r >= 0.05:
+    if prob >= 0.30 or pct_rank >= 0.65:
         return "B"
     return "C"
 
 
-def _conviction_tier(ev_r: float, pct_rank: float) -> str:
-    if ev_r >= 0.20 and pct_rank >= 0.90:
+def _conviction_tier_prob(prob: float, pct_rank: float) -> str:
+    if prob >= 0.38 and pct_rank >= 0.90:
         return "HIGH"
-    if ev_r >= 0.08:
+    if prob >= 0.32 or pct_rank >= 0.75:
         return "MEDIUM"
     return "LOW"
 
@@ -578,34 +578,15 @@ def scan_latest(
     liquid["p_to_short"] = p_to_s
     liquid["ev_short"] = ev_s
 
-    # Load V3 ensemble rank score when available for the scan date; otherwise blend cross-sectional EV + 12-1 momentum
-    v3_oos_path = DATA_DIR / "v3" / "oos_preds.parquet"
-    v3_ens_map: dict[str, float] = {}
-    if v3_oos_path.exists() and latest_date is not None and scan_mode == "LIVE_EOD":
-        try:
-            v3_sub = pd.read_parquet(v3_oos_path, columns=["date", "symbol", "ens"])
-            v3_sub = v3_sub[pd.to_datetime(v3_sub["date"]) == pd.Timestamp(latest_date).normalize()]
-            v3_ens_map = dict(zip(v3_sub["symbol"].astype(str), v3_sub["ens"].astype(float)))
-        except Exception:
-            v3_ens_map = {}
-
-    if v3_ens_map:
-        liquid["v3_ens"] = [v3_ens_map.get(str(s), np.nan) for s in liquid["symbol"]]
-    else:
-        liquid["v3_ens"] = np.nan
-
-    fallback_ens = 0.65 * liquid["ev_long"].rank(pct=True) + 0.35 * liquid["mom_12_1"].rank(pct=True)
-    liquid["v3_ens"] = liquid["v3_ens"].fillna(fallback_ens)
-
     rr = cfg.target_atr_mult / cfg.stop_atr_mult
-    liquid["score_long"] = np.round(liquid["v3_ens"] * 100.0, 1)
-    liquid["score_short"] = np.round((1.0 - liquid["v3_ens"]) * 100.0, 1)
+    liquid["score_long"] = np.round(liquid["prob_long"] * rr * 100.0, 1)
+    liquid["score_short"] = np.round(liquid["prob_short"] * rr * 100.0, 1)
     liquid["target_gain_pct"] = (cfg.target_atr_mult * liquid["atr_14"] / liquid["close"]) * 100.0
 
     eligible = liquid[liquid["target_gain_pct"] >= cfg.min_target_gain_pct].copy()
     if not eligible.empty:
-        eligible["pct_rank_long"] = eligible["v3_ens"].rank(pct=True)
-        eligible["pct_rank_short"] = (1.0 - eligible["v3_ens"]).rank(pct=True)
+        eligible["pct_rank_long"] = eligible["prob_long"].rank(pct=True)
+        eligible["pct_rank_short"] = eligible["prob_short"].rank(pct=True)
 
     def _diversified_select(cands: pd.DataFrame, k: int, max_per_sector: int = 2, max_corr: float = 0.80) -> pd.DataFrame:
         if cands.empty:
@@ -674,8 +655,8 @@ def scan_latest(
             "index_membership": str(row["index_membership"]),
             "is_shortable": bool(row["is_shortable"]),
             "side": side,
-            "grade": _grade_from_ev(ev_r),
-            "conviction_tier": _conviction_tier(ev_r, pct_rank),
+            "grade": _grade_from_win_prob(prob, pct_rank),
+            "conviction_tier": _conviction_tier_prob(prob, pct_rank),
             "ev_r": round(ev_r, 3),
             "score": round(score, 1),
             "win_prob_pct": round(prob * 100, 1),
@@ -697,7 +678,7 @@ def scan_latest(
 
     long_pool = eligible[eligible["prob_long"] >= cfg.min_win_prob] if not eligible.empty else pd.DataFrame()
     top_l_df = (
-        _diversified_select(long_pool.sort_values("v3_ens", ascending=False).head(80), cfg.top_k)
+        _diversified_select(long_pool.sort_values("prob_long", ascending=False).head(80), cfg.top_k)
         if not long_pool.empty
         else pd.DataFrame()
     )
@@ -705,7 +686,7 @@ def scan_latest(
 
     short_pool = eligible[(eligible["is_shortable"]) & (eligible["prob_short"] >= cfg.min_win_prob)] if not eligible.empty else pd.DataFrame()
     top_s_df = (
-        _diversified_select(short_pool.sort_values("v3_ens", ascending=True).head(80), cfg.top_k)
+        _diversified_select(short_pool.sort_values("prob_short", ascending=False).head(80), cfg.top_k)
         if not short_pool.empty
         else pd.DataFrame()
     )
@@ -799,7 +780,7 @@ def score_single_stock(
 
     m = meta_map.get(matched_sym)
     is_shortable = bool(m.is_shortable) if m else True
-    side = "SHORT" if (is_shortable and ev_short > ev_long) else "LONG"
+    side = "SHORT" if (is_shortable and prob_short > prob_long) else "LONG"
 
     entry = float(last["close"])
     rr = cfg.target_atr_mult / cfg.stop_atr_mult
@@ -820,7 +801,7 @@ def score_single_stock(
         ev_r = ev_short
         exp = shap.TreeExplainer(artifacts.model_short)
 
-    score = max(0.0, ev_r) * 100.0
+    score = prob * 100.0
     target_gain_pct = ((tp - entry) / entry * 100.0) if side == "LONG" else ((entry - tp) / entry * 100.0)
     sigma_h = atr * float(np.sqrt(cfg.horizon_days))
 
@@ -831,8 +812,8 @@ def score_single_stock(
         "index_membership": m.index_membership if m else "SP500",
         "as_of": feats.index[-1].strftime("%Y-%m-%d"),
         "side": side,
-        "grade": _grade_from_ev(ev_r),
-        "conviction_tier": _conviction_tier(ev_r, 0.90 if ev_r >= 0.20 else 0.50),
+        "grade": _grade_from_win_prob(prob),
+        "conviction_tier": _conviction_tier_prob(prob, 0.90 if prob >= 0.38 else 0.50),
         "ev_r": round(ev_r, 3),
         "score": round(score, 1),
         "win_prob_pct": round(prob * 100.0, 1),

@@ -60,13 +60,12 @@ def save_ledger(df: pd.DataFrame, path: Path = LEDGER_CSV_PATH) -> None:
 
 
 def sort_ledger_by_win_prob(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort ledger rows by rec_date DESC, then rank ASC (1..K), then score DESC."""
+    """Sort ledger rows in decreasing order of win_prob_pct (with rec_date DESC tie-breaker)."""
     if df.empty:
         return df
     out = df.copy()
-    out["_rk"] = pd.to_numeric(out["rank"], errors="coerce").fillna(999.0)
-    out["_sc"] = pd.to_numeric(out["score"], errors="coerce").fillna(0.0)
-    out = out.sort_values(["rec_date", "_rk", "_sc"], ascending=[False, True, False]).drop(columns=["_rk", "_sc"])
+    out["_wp"] = pd.to_numeric(out["win_prob_pct"], errors="coerce").fillna(0.0)
+    out = out.sort_values(["_wp", "rec_date"], ascending=[False, False]).drop(columns=["_wp"])
     return out.reset_index(drop=True)
 
 

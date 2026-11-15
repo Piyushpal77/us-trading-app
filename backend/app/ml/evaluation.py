@@ -194,8 +194,8 @@ def compute_screener_evaluation(
     mom_l_hits, mom_l_rs, mom_l_ics = [], [], []
     mom_s_hits, mom_s_rs, mom_s_ics = [], [], []
 
-    long_score_col = "ev_long" if "ev_long" in work.columns else "prob_long"
-    short_score_col = "ev_short" if "ev_short" in work.columns else "prob_short"
+    long_score_col = "prob_long"
+    short_score_col = "prob_short"
 
     # Every-day Rank IC with Newey-West (lag=15) across all OOS days
     daily_l_ics: list[float] = []
