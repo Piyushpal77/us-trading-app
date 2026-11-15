@@ -142,6 +142,48 @@ def train_logreg_fold(tr: pd.DataFrame, te: pd.DataFrame) -> tuple[np.ndarray, n
     return p_l, p_s
 
 
+def select_v3_top_k(
+    df: pd.DataFrame,
+    score_col: str,
+    top_k: int,
+    max_per_sector: int = 2,
+) -> pd.DataFrame:
+    """Rank candidates in decreasing order of score_col (%Win) with max_per_sector cap."""
+    if df.empty:
+        return df
+    ranked = df.sort_values(score_col, ascending=False)
+    if "sector" not in ranked.columns or max_per_sector <= 0:
+        return ranked.head(top_k)
+    chosen_idx: list[Any] = []
+    sec_counts: dict[str, int] = {}
+    for idx, row in ranked.iterrows():
+        sec = str(row.get("sector", "Equities"))
+        if sec_counts.get(sec, 0) >= max_per_sector:
+            continue
+        chosen_idx.append(idx)
+        sec_counts[sec] = sec_counts.get(sec, 0) + 1
+        if len(chosen_idx) >= top_k:
+            break
+    return ranked.loc[chosen_idx]
+
+
+def apply_v3_pool_filters(df: pd.DataFrame, cfg: ScreenerConfig) -> pd.DataFrame:
+    """Apply V3 liquidity ($100M), price ($10), and 15-day earnings blackout filters."""
+    if df.empty:
+        return df
+    work = df.copy()
+    min_dvol = max(float(cfg.min_avg_dollar_vol_m), 100.0)
+    if "avg_dollar_vol_m" in work.columns and "close" in work.columns:
+        filtered = work[(work["avg_dollar_vol_m"] >= min_dvol) & (work["close"] >= 10.0)]
+        if len(filtered) >= max(50, cfg.top_k * 2):
+            work = filtered.copy()
+    if "days_to_earn" in work.columns:
+        no_earn = work[~((work["days_to_earn"] >= 0) & (work["days_to_earn"] <= 15))]
+        if len(no_earn) >= max(30, cfg.top_k * 2):
+            work = no_earn.copy()
+    return work
+
+
 def compute_screener_evaluation(
     oos: pd.DataFrame,
     history: dict[str, pd.DataFrame] | None,
@@ -161,7 +203,7 @@ def compute_screener_evaluation(
     if oos.empty:
         return {}
 
-    work = oos.copy()
+    work = apply_v3_pool_filters(oos, cfg)
     work["target_gain_pct"] = (cfg.target_atr_mult * work["atr_14"] / work["close"]) * 100.0
     work = work[work["target_gain_pct"] >= cfg.min_target_gain_pct].copy()
     if work.empty:
@@ -171,8 +213,9 @@ def compute_screener_evaluation(
     work["long_r"] = (work["long_ret"] / risk_pct).clip(-3.0, 4.0)
     work["short_r"] = (work["short_ret"] / risk_pct).clip(-3.0, 4.0)
 
-    mom_map = compute_mom_12_1(history=history, panel=panel)
-    work["mom_12_1"] = [mom_map.get((str(s), pd.Timestamp(d)), np.nan) for s, d in zip(work["symbol"], work["date"])]
+    if "mom_12_1" not in work.columns or work["mom_12_1"].isna().all():
+        mom_map = compute_mom_12_1(history=history, panel=panel)
+        work["mom_12_1"] = [mom_map.get((str(s), pd.Timestamp(d)), np.nan) for s, d in zip(work["symbol"], work["date"])]
 
     unique_dates = np.sort(work["date"].unique())
     # Use non-overlapping horizon_days steps so Rank IC t-stats and bootstrap CIs are independent
@@ -237,8 +280,8 @@ def compute_screener_evaluation(
         base_l_hits.extend(day["y_long"].tolist())
         base_l_rs.extend(day["long_r"].tolist())
 
-        # LightGBM Long Top-K (ranked by EV when available)
-        top_l = day[day["prob_long"] >= cfg.min_win_prob].nlargest(cfg.top_k, long_score_col)
+        # LightGBM Long Top-K (ranked by %Win with V3 max 2/sector)
+        top_l = select_v3_top_k(day[day["prob_long"] >= cfg.min_win_prob], long_score_col, cfg.top_k, max_per_sector=2)
         if not top_l.empty:
             lgbm_l_hits.extend(top_l["y_long"].tolist())
             lgbm_l_rs.extend(top_l["long_r"].tolist())
@@ -260,7 +303,7 @@ def compute_screener_evaluation(
             b_s_hit = float(s_pool["y_short"].mean())
             base_s_hits.extend(s_pool["y_short"].tolist())
             base_s_rs.extend(s_pool["short_r"].tolist())
-            top_s = s_pool[s_pool["prob_short"] >= cfg.min_win_prob].nlargest(cfg.top_k, short_score_col)
+            top_s = select_v3_top_k(s_pool[s_pool["prob_short"] >= cfg.min_win_prob], short_score_col, cfg.top_k, max_per_sector=2)
             if not top_s.empty:
                 lgbm_s_hits.extend(top_s["y_short"].tolist())
                 lgbm_s_rs.extend(top_s["short_r"].tolist())

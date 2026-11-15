@@ -17,7 +17,12 @@ from sklearn.isotonic import IsotonicRegression
 from app.config import DATA_DIR, MODELS_DIR, ScreenerConfig
 from app.data.universe import UniverseMember
 from app.features.indicators import FEATURE_COLS, FEATURE_LABELS, compute_features
-from app.ml.evaluation import compute_screener_evaluation, train_logreg_fold
+from app.ml.evaluation import (
+    apply_v3_pool_filters,
+    compute_screener_evaluation,
+    select_v3_top_k,
+    train_logreg_fold,
+)
 from app.ml.labeling import compute_triple_barrier_labels
 
 
@@ -172,6 +177,16 @@ def build_panel_dataset(
     frames: list[pd.DataFrame] = []
     meta_map = {m.symbol: m for m in universe}
 
+    earn_map: dict[str, np.ndarray] = {}
+    earn_path = DATA_DIR / "earnings_dates.csv"
+    if earn_path.exists():
+        try:
+            ed_df = pd.read_csv(earn_path, parse_dates=["earnings_date"])
+            for s, g in ed_df.groupby("symbol"):
+                earn_map[str(s)] = np.sort(g["earnings_date"].values.astype("datetime64[D]"))
+        except Exception:
+            earn_map = {}
+
     for sym, df in history.items():
         if len(df) < 120:
             continue
@@ -179,9 +194,22 @@ def build_panel_dataset(
         feats["symbol"] = sym
         feats["date"] = feats.index
         m = meta_map.get(sym)
-        feats["sector"] = m.sector if m else "Equities"
+        sec = m.sector if m else "Equities"
+        feats["sector"] = "Information Technology" if sec == "Technology" else sec
         feats["index_membership"] = m.index_membership if m else "SP500"
         feats["is_shortable"] = bool(m.is_shortable) if m else True
+
+        ev = earn_map.get(str(sym))
+        if ev is not None and len(ev) > 0:
+            d_arr = feats.index.values.astype("datetime64[D]")
+            idx = np.searchsorted(ev, d_arr, side="left")
+            valid_mask = idx < len(ev)
+            dte = np.full(len(d_arr), np.nan, dtype=float)
+            if np.any(valid_mask):
+                dte[valid_mask] = np.busday_count(d_arr[valid_mask], ev[idx[valid_mask]]).astype(float)
+            feats["days_to_earn"] = dte
+        else:
+            feats["days_to_earn"] = np.nan
 
         if include_labels:
             labels = compute_triple_barrier_labels(
@@ -271,7 +299,8 @@ def run_walk_forward_backtest(
         return {"equity_curve": [], "metrics": {}}
 
     oos = pd.concat(oos_preds, ignore_index=True)
-    oos_dates = np.sort(oos["date"].unique())
+    oos_filtered = apply_v3_pool_filters(oos, cfg)
+    oos_dates = np.sort(oos_filtered["date"].unique())
     rebal_dates = oos_dates[:: max(1, cfg.horizon_days)]
 
     equity = 100.0
@@ -286,13 +315,13 @@ def run_walk_forward_backtest(
     b_base = None
 
     for dt in rebal_dates:
-        day_df = oos[oos["date"] == dt].copy()
+        day_df = oos_filtered[oos_filtered["date"] == dt].copy()
         day_df["target_gain_pct"] = (cfg.target_atr_mult * day_df["atr_14"] / day_df["close"]) * 100.0
         elig = day_df[day_df["target_gain_pct"] >= cfg.min_target_gain_pct]
         long_pool = elig[elig["prob_long"] >= cfg.min_win_prob]
-        top_l = long_pool.nlargest(cfg.top_k, "prob_long") if not long_pool.empty else pd.DataFrame()
+        top_l = select_v3_top_k(long_pool, "prob_long", cfg.top_k, max_per_sector=2) if not long_pool.empty else pd.DataFrame()
         short_df = elig[(elig["is_shortable"]) & (elig["prob_short"] >= cfg.min_win_prob)]
-        top_s = short_df.nlargest(min(3, cfg.top_k), "prob_short") if not short_df.empty else pd.DataFrame()
+        top_s = select_v3_top_k(short_df, "prob_short", min(3, cfg.top_k), max_per_sector=2) if not short_df.empty else pd.DataFrame()
 
         if not top_l.empty:
             long_hits.extend(top_l["y_long"].tolist())
