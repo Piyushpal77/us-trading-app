@@ -14,6 +14,8 @@ npm-debug.log*
 backend/data_cache/*.db*
 backend/data_cache/ohlcv/
 backend/data_cache/*.parquet
+backend/data_cache/v3/*.parquet
+backend/data_cache/v3/*.log
 
 # OS / Editor
 .DS_Store
